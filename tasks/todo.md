@@ -1,20 +1,17 @@
-# Story 2.2 — schema 建表、meta 與版本化 migration
+# Story 2.3 — [prereq] 寫入前驗證器 validator
 
 ## Plan
-- [ ] 建立 `src/tsic/storage/schema.sql`：v1 DDL
-  - `daily_prices`：欄位依 `models.DailyPrice`，PK `(symbol, date)`，index `(symbol, date DESC)`，`adjusted INTEGER NOT NULL DEFAULT 0`（AC-1 / AC-4）
-  - `chip_flows`、`fundamentals`：欄位依 models，PK `(symbol, date)`
-  - `watchlist`：最小 schema `symbol TEXT PRIMARY KEY`（models 無 Watchlist、§3 未在 repo）
-  - `meta`：`key TEXT PK, value TEXT`
-- [ ] 建立 `src/tsic/storage/migrations.py`
-  - `SCHEMA_VERSION = 1`、`migrate(conn)` 版本化、冪等（AC-3）
-  - 套用 v1：執行 schema.sql + seed `adjust_policy='raw'`，寫入 `schema_version='1'`（AC-2）
-- [ ] 新增 `tests/test_migrations.py`：覆蓋 AC-1~AC-4
-- [ ] 驗證：`uv run pytest`、`uv run ruff check`
+- [x] 建立 `src/tsic/fetching/__init__.py`（新 fetching 套件）
+- [x] 建立 `src/tsic/fetching/validator.py`
+  - `validate_price(price) -> ValidationResult`：date 合法性、OHLCV ≥ 0、close > 0（AC-1~3）
+  - `validate_prices(prices) -> BatchValidation`：回傳有效清單 + 每筆無效一條 warning（並 log）（AC-4）
+- [x] 新增 `tests/test_validator.py`：覆蓋 AC-1~AC-4 + 邊界
+- [x] 驗證：`uv run pytest`、`uv run ruff check`
 
 ## Review
-- 全部步驟完成；29 個測試通過（21 原有 + 8 新增）、ruff 乾淨。
-- `migrate(conn)` 版本化、冪等：以 `meta.schema_version` gate，已是最新則 no-op；重跑不重建表、不報錯，既有資料列保留。
-- `schema.sql` 欄位對齊 `tsic.models`；`daily_prices` PK `(symbol, date)`、index `(symbol, date DESC)`、`adjusted INTEGER NOT NULL DEFAULT 0`。
-- v1 seed `adjust_policy='raw'` 用 `INSERT OR IGNORE`，重跑不覆蓋 operator 變更。
-- 假設：`watchlist` 採最小 schema（`symbol` PK），因 models 無 `Watchlist`、§3 未在 repo。
+- 全部步驟完成；37 個測試通過（29 原有 + 8 新增）、ruff 乾淨。
+- 契約：`ValidationResult(valid, reasons)` 單筆（含 `reason` 合併字串）；`BatchValidation(valid, warnings)` 批次，`len(warnings)` == 無效筆數，可斷言。
+- date 用 `datetime.date.fromisoformat` 判定真實日曆日，擋下 `2026-13-40`。
+- OHLCV（open/high/low/close/volume）須 ≥ 0；close 另須 > 0（close=0 / 負值皆拒絕）。
+- warning 同時回傳清單並走 `logging.warning`，對齊 storage 層觀測性慣例。
+- 假設：採 `fetching/validator.py` 模組位置（依 Story Reference）；單筆 API 命名 `validate_price`（依 AC-1），批次補 `validate_prices`。
