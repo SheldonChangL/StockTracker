@@ -38,7 +38,15 @@ from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.message import Message
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Markdown, ProgressBar, Static
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Markdown,
+    ProgressBar,
+    Static,
+)
 from textual.worker import WorkerState
 
 from tsic.fetching.orchestrator import FetchSummary
@@ -94,6 +102,54 @@ class Analyzer(Protocol):
         ...
 
 
+class WatchlistEditor(Protocol):
+    """The write side of the watchlist, so symbols can be managed inside the TUI.
+
+    Production wiring injects :class:`~tsic.storage.repository.WatchlistRepository`;
+    tests inject a fake. Depending on this protocol (not the concrete repository)
+    keeps :class:`TsicApp` decoupled from storage, matching the read-side
+    :class:`~tsic.tui.watchlist_view.WatchlistSource` seam. When no editor is
+    injected the ``n``/``d`` keys become no-ops.
+    """
+
+    def add(self, symbol: str) -> None:
+        """Track ``symbol`` (idempotent)."""
+        ...
+
+    def remove(self, symbol: str) -> None:
+        """Stop tracking ``symbol`` (a no-op when not tracked)."""
+        ...
+
+
+class AddSymbolScreen(Screen):
+    """A modal prompt for a new watchlist symbol (the ``n`` key).
+
+    Submitting the input dismisses the screen with the typed symbol; ``escape``
+    cancels with no result. Keeping the prompt on its own screen means the main
+    screen needs no always-present input widget and no custom CSS.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "取消")]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Input(placeholder="輸入股票代號，例如 2330", id="symbol-input")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        """Focus the input so the user can type immediately."""
+        self.query_one("#symbol-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Dismiss with the trimmed symbol (or cancel when the field is blank)."""
+        symbol = event.value.strip()
+        self.dismiss(symbol or None)
+
+    def action_cancel(self) -> None:
+        """Close the prompt without adding anything."""
+        self.dismiss(None)
+
+
 class AnalysisScreen(Screen):
     """A full-screen, scrollable view of one symbol's AI analysis.
 
@@ -132,6 +188,8 @@ class TsicApp(App):
     #: ``a`` act on the row the watchlist cursor is on; ``u`` updates the whole
     #: injected batch; ``q`` quits (Textual's built-in ``action_quit``).
     BINDINGS = [
+        Binding("n", "add_symbol", "新增"),
+        Binding("d", "remove_symbol", "刪除"),
         Binding("f", "fetch_selected", "更新選取"),
         Binding("a", "analyze_selected", "分析"),
         Binding("u", "update", "全部更新"),
@@ -172,6 +230,7 @@ class TsicApp(App):
         symbols: Sequence[str] | None = None,
         date_range: tuple[str, str] | None = None,
         analyzer: Analyzer | None = None,
+        watchlist_editor: WatchlistEditor | None = None,
     ) -> None:
         """Build the app over a watchlist data source.
 
@@ -192,6 +251,7 @@ class TsicApp(App):
         self._symbols = list(symbols or [])
         self._date_range = date_range
         self._analyzer = analyzer
+        self._watchlist_editor = watchlist_editor
         #: The most recent :class:`AnalysisReady` message, or ``None`` until the
         #: first ``a`` run completes; lets a test assert the analysis arrived.
         self.last_analysis: TsicApp.AnalysisReady | None = None
@@ -326,6 +386,49 @@ class TsicApp(App):
         output = self._analyzer.analyze(symbol)
         self.post_message(self.AnalysisReady(symbol, output))
         return output
+
+    def action_add_symbol(self) -> None:
+        """Prompt for a symbol and add it to the watchlist (the ``n`` key).
+
+        Opens :class:`AddSymbolScreen`; :meth:`_on_symbol_entered` handles the
+        result. A no-op (with a hint) when no watchlist editor was injected.
+        """
+        if self._watchlist_editor is None:
+            self._set_status("此畫面未連接 watchlist 寫入，無法新增。")
+            return
+        self.push_screen(AddSymbolScreen(), self._on_symbol_entered)
+
+    def _on_symbol_entered(self, symbol: str | None) -> None:
+        """Persist the entered symbol, redraw, then fetch its data (Story: TUI add).
+
+        The new symbol joins the batch ``u`` set and is fetched immediately so it
+        does not linger as a 缺失 row the user would have to update by hand.
+        """
+        if symbol is None or self._watchlist_editor is None:
+            return
+        self._watchlist_editor.add(symbol)
+        if symbol not in self._symbols:
+            self._symbols.append(symbol)
+        self._refresh_rows()
+        self._set_status(f"已新增 {symbol}，抓取資料中…")
+        self._start_fetch([symbol])
+
+    def action_remove_symbol(self) -> None:
+        """Remove the cursor-selected symbol from the watchlist (the ``d`` key).
+
+        A no-op when no editor was injected or the watchlist is empty.
+        """
+        if self._watchlist_editor is None:
+            self._set_status("此畫面未連接 watchlist 寫入，無法刪除。")
+            return
+        symbol = self._selected_symbol()
+        if symbol is None:
+            return
+        self._watchlist_editor.remove(symbol)
+        if symbol in self._symbols:
+            self._symbols.remove(symbol)
+        self._refresh_rows()
+        self._set_status(f"已刪除 {symbol}")
 
     def _selected_symbol(self) -> str | None:
         """Return the symbol under the watchlist cursor, or ``None`` when empty.

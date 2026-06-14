@@ -280,6 +280,88 @@ def test_press_a_is_noop_without_analyzer() -> None:
     asyncio.run(scenario())
 
 
+# --- TUI watchlist editing: "n" adds, "d" removes ---------------------------
+
+
+class FakeWatchlist:
+    """A WatchlistSource that is also a WatchlistEditor, backed by a symbol list."""
+
+    def __init__(self, symbols: tuple[str, ...] = ()) -> None:
+        self.symbols = list(symbols)
+        self.added: list[str] = []
+        self.removed: list[str] = []
+
+    def watchlist_rows(self) -> list[WatchlistRow]:
+        return [WatchlistRow(symbol) for symbol in self.symbols]
+
+    def add(self, symbol: str) -> None:
+        self.added.append(symbol)
+        if symbol not in self.symbols:
+            self.symbols.append(symbol)
+
+    def remove(self, symbol: str) -> None:
+        self.removed.append(symbol)
+        if symbol in self.symbols:
+            self.symbols.remove(symbol)
+
+
+def test_press_n_adds_symbol_from_tui() -> None:
+    """``n`` opens the prompt; submitting a symbol persists it and shows the row."""
+
+    async def scenario() -> None:
+        from textual.widgets import DataTable
+
+        store = FakeWatchlist()
+        app = TsicApp(repo=store, watchlist_editor=store)
+        async with app.run_test() as pilot:
+            await pilot.press("n")
+            await pilot.pause()
+            await pilot.press("2", "3", "3", "0", "enter")
+            await pilot.pause()
+            assert store.added == ["2330"]
+            table = pilot.app.query_one("#watchlist-table", DataTable)
+            assert table.row_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_press_d_removes_selected_symbol() -> None:
+    """``d`` removes the cursor-selected symbol and redraws the table."""
+
+    async def scenario() -> None:
+        from textual.widgets import DataTable
+
+        store = FakeWatchlist(("2330", "2317"))
+        app = TsicApp(repo=store, watchlist_editor=store)
+        async with app.run_test() as pilot:
+            await pilot.press("d")
+            await pilot.pause()
+            assert store.removed == ["2330"]
+            table = pilot.app.query_one("#watchlist-table", DataTable)
+            assert table.row_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_add_remove_are_noop_without_editor() -> None:
+    """No editor injected: ``n`` opens no prompt and ``d`` removes nothing."""
+
+    async def scenario() -> None:
+        from textual.widgets import DataTable
+
+        async with TsicApp(repo=_two_row_repo()).run_test() as pilot:
+            await pilot.press("n")
+            await pilot.pause()
+            # No prompt screen was pushed over the watchlist.
+            assert len(pilot.app.screen_stack) == 1
+            await pilot.press("d")
+            await pilot.pause()
+            table = pilot.app.query_one("#watchlist-table", DataTable)
+            assert table.row_count == 2
+
+    asyncio.run(scenario())
+
+
 # --- AC-3: "q" quits the app ------------------------------------------------
 
 

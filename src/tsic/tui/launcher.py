@@ -158,6 +158,7 @@ def build_app(
         symbols=symbols,
         date_range=date_range,
         analyzer=analyzer,
+        watchlist_editor=watchlist,
     )
 
 
