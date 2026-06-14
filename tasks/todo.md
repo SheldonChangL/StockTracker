@@ -1,28 +1,41 @@
-# Story 2.5 — `tsic db clean <代號>` 安全刪除某檔資料
+# Story 3.7 — FetchOrchestrator（ThreadPoolExecutor + fallback + continue-on-failure）
 
 ## Plan
-- [ ] 新增 `src/tsic/storage/maintenance.py`
-  - `DATA_TABLES`：`("daily_prices", "chip_flows", "fundamentals")`
-  - `count_symbol_records(conn, symbol) -> int`：三表合計筆數
-  - `delete_symbol(conn, symbol) -> int`：刪除三表該 symbol 所有列、commit、回傳刪除總數
-- [ ] 新增 `src/tsic/commandline/db_cmd.py`
-  - `db_app` Typer 子群組（`db` 命令群）
-  - `clean(symbol, --db-path)`：connect+migrate → count → 確認提示 → 刪除/取消
-  - 提示文字（AC-3）：`將刪除 {代號} 共 {N} 筆記錄，確認？(y/N)`，預設 N
-  - 輸入 `n`/Enter → 輸出取消訊息、不刪除、exit 0（AC-1）
-  - 輸入 `y` → 刪除三表、輸出結果、exit 0（AC-2）
-- [ ] 修改 `src/tsic/commandline/app.py`：移除 `db` stub，改用 `app.add_typer(db_app, name="db")`
-- [ ] 新增 `tests/test_db_cmd.py`：AC-1~AC-3 + 邊界（0 筆、僅刪指定 symbol、提示預設 N）
-- [ ] 新增 `tests/test_maintenance.py`：count/delete 行為
+- [ ] 新增 `src/tsic/fetching/orchestrator.py`
+  - `FetchSummary` dataclass：彙整每檔 `FetchResult`，提供 `succeeded/skipped/failed`
+    分類與計數、`render()` 產出「成功 N / 跳過 N / 失敗 N（附原因）」（AC-3）
+  - `FetchOrchestrator(sources, repository, *, concurrency=3, timeout=None, validator)`
+    - sources 依 `priority` 升冪排序；`available=False` 的來源跳過（AC-1）
+    - `fetch_prices(symbols, start, end) -> FetchSummary`：以
+      `ThreadPoolExecutor(max_workers=concurrency)` 並發；逐 future
+      `result(timeout=...)` 做 future-level timeout 保護（不使用 signal）（AC-4）
+    - `_fetch_symbol`：
+      - resume start = `MAX(date)+1`（無資料則用傳入 start）（AC-5）
+      - resume start > end → 跳過（已最新無新資料）（AC-3 skipped）
+      - 依序試來源，raise 則記原因換下一來源（fallback）（AC-1）
+      - 來源成功 → validate → upsert；寫入 >0=成功、=0=跳過
+      - 全部來源失敗 → 失敗並附原因（continue-on-failure）（AC-2）
+    - repo 存取以 `threading.Lock` 序列化（NFR-9；ADR-1 write-serialization）
+- [ ] 更新 `src/tsic/fetching/__init__.py`：匯出 `FetchOrchestrator`、`FetchSummary`
+- [ ] 新增 `tests/test_orchestrator.py`：AC-1~AC-5 + 邊界
 - [ ] 驗證：`uv run pytest`、`uv run ruff check`
 
 ## Review
-- 全部步驟完成；62 個測試通過（51 原有 + 11 新增）、ruff 乾淨；CLI 端對端三情境（n / Enter / y）皆驗證 exit 0。
-- AC-1：輸入 `n` 或直接 Enter → `typer.confirm(default=False)` 回 False，輸出「已取消…」、不刪除、exit 0。
-- AC-2：輸入 `y` → `delete_symbol` 刪除 `daily_prices`/`chip_flows`/`fundamentals` 三表該 symbol 所有列（單一 commit）、exit 0。
-- AC-3：提示文字為 `將刪除 {代號} 共 {N} 筆記錄，確認？(y/N)`（click 預設加 `: ` 後綴），`show_default=False` 避免重複 `[y/N]`，預設 N。
-- 架構：`db` 由 stub `@app.command` 改為 `app.add_typer(db_app)` 子群組；刪除/計數放在 `storage/maintenance.py`，沿用 conn-injection 慣例（不自行管 lifecycle）。
-- 假設與決策：
-  - 「資料」範圍 = 三張 per-symbol 資料表，`meta`/`watchlist` 不在刪除範圍。
-  - 新增 `--db-path` 選項供測試注入暫存 DB；未指定時用 `settings.default_db_path()`。
-  - `clean` 內呼叫 `migrations.migrate` 確保表存在（idempotent），N=0 仍照常提示。
+- 完成全部步驟；134 測試通過（124 原有 + 10 新增）、ruff 乾淨。
+- AC-1：sources 依 `priority` 升冪試用，raise 即記錄原因換下一來源並成功寫入；
+  `available=False` 來源直接跳過不算失敗。
+- AC-2：單檔所有來源失敗→`FetchResult(success=False)` 附各來源原因，批次續跑其他檔。
+- AC-3：`FetchSummary` 以每檔 `FetchResult` 衍生 succeeded/skipped/failed 三類，
+  `render()` 產出「成功 N / 跳過 N / 失敗 N」+ 失敗原因；分類可斷言。
+- AC-4：`ThreadPoolExecutor(max_workers=concurrency)`；逐 future `result(timeout=)`
+  做 future-level timeout（無 signal），超時記為失敗、`shutdown(wait=False,
+  cancel_futures=True)` 不被卡住的 worker 拖住整批。
+- AC-5：resume start = `MAX(date)+1`（無資料用傳入 start）；start>end→skipped；
+  靠 repo first-write-wins upsert 確保續傳無重複。
+- 設計決策：
+  - 沿用既有 `FetchResult` model（success/rows 衍生三態），不新增 model 欄位。
+  - repo 存取以 `threading.Lock` 序列化（ADR-1 write-serialization、NFR-9）；
+    實務上單一 sqlite 連線跨執行緒需 `check_same_thread=False`（docstring 已註明）。
+  - `timeout` 預設 `None`（不限時）為可選保護，避免硬塞魔術數字。
+- 限制：未接 CLI `fetch` 指令（本故事為 prereq，wiring 留待後續故事）；
+  僅實作 `fetch_prices`，chips/fundamentals 編排不在本故事範圍。
