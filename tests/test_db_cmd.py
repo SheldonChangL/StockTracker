@@ -1,11 +1,14 @@
-"""Tests for the ``tsic db clean`` command (Story 2.5)."""
+"""Tests for the ``tsic db clean`` (Story 2.5) and ``db status`` (Story 2.6)
+commands."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
+from tsic import settings
 from tsic.commandline.app import app
 from tsic.storage import database, maintenance, migrations
 
@@ -114,3 +117,74 @@ def test_clean_zero_records_prompts_with_zero(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert "將刪除 2330 共 0 筆記錄" in result.stdout
+
+
+# --- db status (Story 2.6) ---------------------------------------------------
+
+
+# AC-1: a missing default ~/.tsic/ is auto-created, reports 0 tracked, exits 0.
+def test_status_missing_default_db_auto_creates_and_reports_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    default_db = tmp_path / ".tsic" / "data.db"
+    monkeypatch.setattr(settings, "default_db_path", lambda: default_db)
+    assert not default_db.parent.exists()
+
+    result = runner.invoke(app, ["db", "status"])
+
+    assert result.exit_code == 0
+    assert "0 檔追蹤" in result.stdout
+    assert default_db.exists()  # real connect/migrate created it
+
+
+# AC-2: a populated db shows file size, tracked count, and per-symbol dates.
+def test_status_reports_size_count_and_latest_dates(tmp_path: Path) -> None:
+    db_path = tmp_path / "data.db"
+    _make_db(db_path, "2330", rows=2)  # 2026-06-10, 2026-06-11
+    _make_db(db_path, "2317", rows=3)  # 2026-06-10, 2026-06-11, 2026-06-12
+
+    result = runner.invoke(app, ["db", "status", "--db", str(db_path)])
+
+    assert result.exit_code == 0
+    assert "追蹤股票數：2" in result.stdout
+    assert f"{db_path.stat().st_size} bytes" in result.stdout
+    assert "2330  最新資料日期：2026-06-11" in result.stdout
+    assert "2317  最新資料日期：2026-06-12" in result.stdout
+
+
+def test_status_counts_symbols_across_all_data_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "data.db"
+    conn = database.connect(db_path)
+    try:
+        migrations.migrate(conn)
+        conn.execute(
+            "INSERT INTO chip_flows "
+            "(symbol, date, foreign_net, trust_net, dealer_net, source) "
+            "VALUES ('2603', '2026-06-09', 0, 0, 0, 'test')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = runner.invoke(app, ["db", "status", "--db", str(db_path)])
+
+    assert result.exit_code == 0
+    assert "追蹤股票數：1" in result.stdout
+    assert "2603  最新資料日期：2026-06-09" in result.stdout
+
+
+# AC-3: --db targets the given path, not the default.
+def test_status_db_option_targets_custom_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    default_db = tmp_path / "default" / "data.db"
+    monkeypatch.setattr(settings, "default_db_path", lambda: default_db)
+    custom_db = tmp_path / "custom" / "x.db"
+    _make_db(custom_db, "2330", rows=1)
+
+    result = runner.invoke(app, ["db", "status", "--db", str(custom_db)])
+
+    assert result.exit_code == 0
+    assert str(custom_db) in result.stdout
+    assert "追蹤股票數：1" in result.stdout
+    assert not default_db.exists()  # default path untouched
