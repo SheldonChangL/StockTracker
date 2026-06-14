@@ -56,6 +56,10 @@ _DEFAULT_CONCURRENCY = 3
 #: Write-time validator signature; injectable so tests can swap it out.
 Validator = Callable[[list[DailyPrice]], BatchValidation]
 
+#: Progress callback signature: invoked with ``(completed, total)`` after each
+#: symbol finishes, so a UI can drive a progress bar (Story 8.3, FR-30).
+ProgressCallback = Callable[[int, int], None]
+
 
 @dataclass
 class FetchSummary:
@@ -158,7 +162,12 @@ class FetchOrchestrator:
         self._repo_lock = threading.Lock()
 
     def fetch_prices(
-        self, symbols: Sequence[str], start: str, end: str
+        self,
+        symbols: Sequence[str],
+        start: str,
+        end: str,
+        *,
+        progress: ProgressCallback | None = None,
     ) -> FetchSummary:
         """Fetch ``[start, end]`` OHLCV for every symbol and summarize.
 
@@ -172,6 +181,10 @@ class FetchOrchestrator:
             start: Inclusive ISO ``YYYY-MM-DD`` lower bound for symbols with no
                 stored history yet.
             end: Inclusive ISO ``YYYY-MM-DD`` upper bound for every symbol.
+            progress: Optional callback invoked with ``(completed, total)`` after
+                each symbol finishes (success or failure), letting a caller drive
+                a progress bar without coupling to the orchestrator's internals
+                (Story 8.3). Invoked from the calling thread, never concurrently.
 
         Returns:
             A :class:`FetchSummary` with one result per symbol.
@@ -195,15 +208,26 @@ class FetchOrchestrator:
                     message = f"timed out after {self._timeout}s"
                     logger.warning("fetch for %s %s", symbol, message)
                     results.append(
-                        FetchResult(symbol=symbol, success=False, message=message,
-                                    errors=[message])
+                        FetchResult(
+                            symbol=symbol,
+                            success=False,
+                            message=message,
+                            errors=[message],
+                        )
                     )
                 except Exception as exc:  # noqa: BLE001 - defensive batch guard.
                     logger.warning("fetch for %s raised: %s", symbol, exc)
                     results.append(
-                        FetchResult(symbol=symbol, success=False,
-                                    message=str(exc), errors=[str(exc)])
+                        FetchResult(
+                            symbol=symbol,
+                            success=False,
+                            message=str(exc),
+                            errors=[str(exc)],
+                        )
                     )
+                # Report progress once per finished symbol, regardless of outcome.
+                if progress is not None:
+                    progress(len(results), len(symbols))
         finally:
             # Do not block batch completion on a wedged worker thread (AC-4);
             # not-yet-started fetches are cancelled.
@@ -253,17 +277,28 @@ class FetchOrchestrator:
 
             if written > 0:
                 message = f"fetched {written} row(s) from {source.name}"
-                return FetchResult(symbol=symbol, source=source.name, success=True,
-                                   rows=written, message=message, errors=errors)
+                return FetchResult(
+                    symbol=symbol,
+                    source=source.name,
+                    success=True,
+                    rows=written,
+                    message=message,
+                    errors=errors,
+                )
 
             message = f"{symbol}: no new data from {source.name}"
-            return FetchResult(symbol=symbol, source=source.name, success=True,
-                               rows=0, message=message, errors=errors)
+            return FetchResult(
+                symbol=symbol,
+                source=source.name,
+                success=True,
+                rows=0,
+                message=message,
+                errors=errors,
+            )
 
         message = f"all sources failed for {symbol}"
         logger.warning(message)
-        return FetchResult(symbol=symbol, success=False, message=message,
-                           errors=errors)
+        return FetchResult(symbol=symbol, success=False, message=message, errors=errors)
 
     def _resume_start(self, symbol: str, default_start: str) -> str:
         """Return the resume date: ``MAX(date) + 1`` or ``default_start`` (AC-5)."""
