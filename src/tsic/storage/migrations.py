@@ -14,7 +14,7 @@ import sqlite3
 from pathlib import Path
 
 #: Latest schema version this module knows how to produce.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: DDL for the current schema, kept alongside this module.
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
@@ -44,6 +44,8 @@ def migrate(conn: sqlite3.Connection) -> int:
 
     if version < 1:
         _apply_v1(conn)
+    if version < 2:
+        _apply_v2(conn)
 
     _set_version(conn, SCHEMA_VERSION)
     conn.commit()
@@ -73,6 +75,21 @@ def _apply_v1(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
         _V1_META_SEED.items(),
     )
+
+
+def _apply_v2(conn: sqlite3.Connection) -> None:
+    """Add ``watchlist.added_at`` for databases created before v2.
+
+    Fresh databases already gain the column from ``schema.sql`` in v1, so the
+    ALTER is guarded by a column-existence check to stay idempotent. The
+    ``DEFAULT ''`` only satisfies the NOT NULL constraint for any rows that
+    predate the column; the repository always writes a real timestamp.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(watchlist)")}
+    if "added_at" not in columns:
+        conn.execute(
+            "ALTER TABLE watchlist ADD COLUMN added_at TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def _set_version(conn: sqlite3.Connection, version: int) -> None:

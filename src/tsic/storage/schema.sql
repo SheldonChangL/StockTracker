@@ -47,10 +47,12 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     PRIMARY KEY (symbol, date)
 );
 
--- Symbols the user is tracking. Minimal schema: §3 defines no extra columns
--- and there is no Watchlist dataclass yet, so only the symbol key is stored.
+-- Symbols the user is tracking. ``added_at`` is the ISO-8601 timestamp recorded
+-- when a symbol first enters the watchlist (Story 6.1, FR-22). Added in schema
+-- v2; existing v1 databases gain the column via the v2 migration.
 CREATE TABLE IF NOT EXISTS watchlist (
-    symbol TEXT PRIMARY KEY NOT NULL
+    symbol   TEXT PRIMARY KEY NOT NULL,
+    added_at TEXT NOT NULL
 );
 
 -- Key/value store for schema versioning and operational policy flags.

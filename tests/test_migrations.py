@@ -76,8 +76,32 @@ def test_daily_prices_adjusted_column(conn: sqlite3.Connection) -> None:
 def test_meta_seed_values(conn: sqlite3.Connection) -> None:
     """AC-2: meta holds schema_version='1' and adjust_policy='raw'."""
     migrations.migrate(conn)
-    assert _meta(conn, "schema_version") == "1"
+    assert _meta(conn, "schema_version") == str(migrations.SCHEMA_VERSION)
     assert _meta(conn, "adjust_policy") == "raw"
+
+
+def test_watchlist_has_added_at_column(conn: sqlite3.Connection) -> None:
+    """Story 6.1: watchlist gains added_at (TEXT NOT NULL) in schema v2."""
+    migrations.migrate(conn)
+    cols = {row[1]: row for row in conn.execute("PRAGMA table_info(watchlist)")}
+    assert "added_at" in cols
+    assert cols["added_at"][2] == "TEXT"  # type
+    assert cols["added_at"][3] == 1  # notnull
+
+
+def test_v1_database_upgrades_watchlist_to_v2(conn: sqlite3.Connection) -> None:
+    """An existing v1 watchlist gains added_at when migrated forward to v2."""
+    # Simulate a database left at schema v1 (watchlist without added_at).
+    conn.execute("CREATE TABLE watchlist (symbol TEXT PRIMARY KEY NOT NULL)")
+    conn.execute(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '1')")
+    conn.commit()
+
+    assert migrations.migrate(conn) == migrations.SCHEMA_VERSION
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(watchlist)")}
+    assert "added_at" in cols
 
 
 def test_migrate_returns_schema_version(conn: sqlite3.Connection) -> None:
@@ -100,7 +124,7 @@ def test_migration_is_idempotent(conn: sqlite3.Connection) -> None:
 
     # Tables not rebuilt: the previously inserted row survives.
     assert _tables(conn) == tables_before
-    assert _meta(conn, "schema_version") == "1"
+    assert _meta(conn, "schema_version") == str(migrations.SCHEMA_VERSION)
     rows = conn.execute("SELECT COUNT(*) FROM daily_prices").fetchone()[0]
     assert rows == 1
 

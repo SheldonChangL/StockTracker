@@ -74,6 +74,18 @@ class Fundamental:
 
 
 @dataclass
+class WatchlistEntry:
+    """A symbol the user is tracking, with the time it was added.
+
+    ``added_at`` is an ISO-8601 timestamp string recorded when the symbol first
+    enters the watchlist (Story 6.1, FR-22).
+    """
+
+    symbol: str = ""
+    added_at: str = ""
+
+
+@dataclass
 class FetchResult:
     """Outcome wrapper returned by data-fetch operations."""
 
