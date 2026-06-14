@@ -16,6 +16,7 @@ import typer
 from tsic import __version__
 from tsic.commandline.db_cmd import db_app
 from tsic.commandline.fetch_cmd import fetch as fetch_command
+from tsic.commandline.query_cmd import query as query_command
 
 #: Help text shown at the root of the command tree.
 _ROOT_HELP = "tsic — StockTracker interactive console."
@@ -61,11 +62,8 @@ def _stub(ctx: typer.Context, name: str) -> None:
 #: ``tsic fetch`` is delivered by its own module (Story 3.8); register it here.
 app.command(name="fetch")(fetch_command)
 
-
-@app.command()
-def query(ctx: typer.Context) -> None:
-    """Query stored market data."""
-    _stub(ctx, "query")
+#: ``tsic query`` is delivered by its own module (Story 4.2); register it here.
+app.command(name="query")(query_command)
 
 
 @app.command()

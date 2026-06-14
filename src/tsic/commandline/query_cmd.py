@@ -1,24 +1,29 @@
-"""Query-result output formatting for the ``tsic query`` command (Story 4.1).
+"""The ``tsic query`` command: read cached prices and render a range (Story 4.2).
 
-This module is the *prerequisite* presentation layer for querying stored market
-data: it turns a list of :class:`~tsic.models.DailyPrice` rows into one of three
-textual representations so the result can be piped to other tools or read
-directly (FR-19).
+This module is the *vertical* entry point that turns ``tsic query 2330`` into a
+real cache read: it opens and migrates the local database, runs an inclusive
+date-range query through :class:`~tsic.storage.repository.PriceRepository`
+(Story 2.4), and renders the result in the requested format (FR-19, NFR-4).
+
+The presentation layer (the prerequisite from Story 4.1) turns a list of
+:class:`~tsic.models.DailyPrice` rows into one of three textual representations
+so the result can be piped to other tools or read directly:
 
 * ``json`` — a valid JSON array of objects (``[]`` when empty), each object
-  carrying every OHLCV field plus ``date``/``symbol`` (AC-1/AC-4).
+  carrying every OHLCV field plus ``date``/``symbol`` (AC-1).
 * ``csv``  — a header row followed by one line per record, columns in a fixed
-  order; an empty result yields the header alone (AC-2/AC-4).
+  order; an empty result yields the header alone (AC-2).
 * ``table`` — a Rich table rendered to a string; an empty result renders the
-  header with no body rows rather than raising (AC-3/AC-4).
+  header with no body rows rather than raising.
 
 The column order is the single source of truth derived from the
 :class:`~tsic.models.DailyPrice` dataclass field order, so every format agrees
 on which columns appear and in what sequence.
 
-Wiring this formatter into the ``tsic query`` command (argument parsing, the
-``--format`` flag, db access) is delivered by a later story; here we expose only
-:func:`format_output` so it can be unit-tested in isolation.
+Exit code follows the query outcome: a query that matches at least one row
+prints the formatted result and exits ``0`` (AC-1); a query that matches no
+rows — an unknown symbol or an empty range — prints a "no data" notice and
+exits ``2`` (AC-3).
 """
 
 from __future__ import annotations
@@ -27,11 +32,21 @@ import csv
 import io
 import json
 from dataclasses import asdict, fields
+from pathlib import Path
 
+import typer
 from rich.console import Console
 from rich.table import Table
 
 from tsic.models import DailyPrice
+from tsic.storage import database, migrations
+from tsic.storage.repository import PriceRepository
+
+#: Default inclusive range bounds used when ``--start`` / ``--end`` are omitted.
+#: ISO date strings compare lexically, so these sentinels select every stored
+#: row regardless of its date.
+_MIN_DATE = "0001-01-01"
+_MAX_DATE = "9999-12-31"
 
 #: Output columns in fixed order, derived from the ``DailyPrice`` field order so
 #: every format (json/csv/table) shares one column contract (AC-1/AC-2).
@@ -94,3 +109,48 @@ def _to_table(rows: list[DailyPrice]) -> str:
     with console.capture() as capture:
         console.print(table)
     return capture.get()
+
+
+def query(
+    symbol: str = typer.Argument(..., help="股票代號（例如 2330）。"),
+    db_path: Path | None = typer.Option(
+        None,
+        "--db",
+        "--db-path",
+        help="覆寫資料庫路徑（預設 ~/.tsic/data.db）。",
+    ),
+    start: str = typer.Option(
+        _MIN_DATE, "--start", help="查詢區間起始日（ISO YYYY-MM-DD，含當日）。"
+    ),
+    end: str = typer.Option(
+        _MAX_DATE, "--end", help="查詢區間結束日（ISO YYYY-MM-DD，含當日）。"
+    ),
+    fmt: str = typer.Option(
+        "table", "--format", help=f"輸出格式：{'/'.join(_FORMATS)}。"
+    ),
+) -> None:
+    """Query cached prices for SYMBOL and print the matching range (FR-19).
+
+    Reads from the local cache only — no network access — so a cached query
+    returns well within the NFR-4 budget (AC-4). Matching rows are printed in
+    the requested format and the command exits ``0`` (AC-1/AC-2); a query that
+    matches nothing prints a notice and exits ``2`` (AC-3).
+    """
+    if fmt not in _FORMATS:
+        raise typer.BadParameter(
+            f"unsupported format {fmt!r}; expected one of {_FORMATS}",
+            param_hint="--format",
+        )
+
+    conn = database.connect(db_path)
+    try:
+        migrations.migrate(conn)
+        rows = PriceRepository(conn).query_prices(symbol, start, end)
+    finally:
+        conn.close()
+
+    if not rows:
+        typer.echo(f"無資料：{symbol} 在指定區間內沒有任何記錄。")
+        raise typer.Exit(code=2)
+
+    typer.echo(format_output(rows, fmt))
