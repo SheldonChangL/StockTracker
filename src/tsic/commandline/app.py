@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import typer
 
 from tsic import __version__
+from tsic.commandline.db_cmd import db_app
 
 #: Help text shown at the root of the command tree.
 _ROOT_HELP = "tsic — StockTracker interactive console."
@@ -74,10 +75,7 @@ def analyze(ctx: typer.Context) -> None:
     _stub(ctx, "analyze")
 
 
-@app.command()
-def db(ctx: typer.Context) -> None:
-    """Manage the local database."""
-    _stub(ctx, "db")
+app.add_typer(db_app, name="db")
 
 
 @app.command()
