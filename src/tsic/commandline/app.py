@@ -18,6 +18,7 @@ from tsic.commandline.analyze_cmd import analyze as analyze_command
 from tsic.commandline.db_cmd import db_app
 from tsic.commandline.fetch_cmd import fetch as fetch_command
 from tsic.commandline.query_cmd import query as query_command
+from tsic.commandline.watch_cmd import watch_app
 
 #: Help text shown at the root of the command tree.
 _ROOT_HELP = "tsic — StockTracker interactive console."
@@ -72,11 +73,8 @@ app.command(name="analyze")(analyze_command)
 
 app.add_typer(db_app, name="db")
 
-
-@app.command()
-def watch(ctx: typer.Context) -> None:
-    """Watch symbols for updates."""
-    _stub(ctx, "watch")
+#: ``tsic watch`` is delivered by its own module (Story 6.2); register it here.
+app.add_typer(watch_app, name="watch")
 
 
 @app.command()
