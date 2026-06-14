@@ -45,14 +45,31 @@ class ChipFlow:
 
 @dataclass
 class Fundamental:
-    """Per-symbol fundamental (基本面) snapshot for a given date."""
+    """Per-symbol fundamental (基本面) snapshot.
+
+    Story 3.6 introduces best-effort *quarterly* fundamentals from MOPS, keyed by
+    a fiscal ``period`` (``YYYYQn``). Crawling MOPS is best-effort: any metric the
+    page does not surface (or that fails to parse) is left ``None`` rather than
+    guessed, so callers must treat every quarterly field as optional.
+
+    ``pe_ratio_qtr_end`` is the **quarter-end P/E snapshot as reported by MOPS**
+    — it is never recomputed from a live price.
+
+    The legacy ``date`` / ``pe`` / ``pb`` / ``dividend_yield`` fields predate this
+    story; they are retained so the existing ``fundamentals`` table and its
+    callers keep working until fundamentals persistence is wired in a later story.
+    """
 
     symbol: str = ""
     date: str = ""
-    eps: float = 0.0
+    period: str | None = None
+    eps: float | None = None
     pe: float = 0.0
     pb: float = 0.0
     dividend_yield: float = 0.0
+    pe_ratio_qtr_end: float | None = None
+    revenue: float | None = None
+    gross_margin: float | None = None
     source: str = ""
 
 
