@@ -1,9 +1,11 @@
-"""The ``tsic db`` command group: local database maintenance (Story 2.5).
+"""The ``tsic db`` command group: local database maintenance (Stories 2.5, 2.6).
 
-Currently hosts ``db clean <symbol>``, which removes all of a symbol's stored
-records after an explicit confirmation. The destructive action defaults to *no*:
-an empty answer (just Enter) or anything other than ``y`` cancels and leaves the
-database untouched, so a mistyped command never deletes data by accident.
+Hosts ``db clean <symbol>``, which removes all of a symbol's stored records
+after an explicit confirmation (the destructive action defaults to *no*: an
+empty answer or anything other than ``y`` cancels), and ``db status``, a
+read-only overview of the local cache (file size, tracked-symbol count, and
+each symbol's latest stored date). Both run through the real connect/migrate
+path, so invoking either against a missing database creates and migrates it.
 """
 
 from __future__ import annotations
@@ -12,7 +14,8 @@ from pathlib import Path
 
 import typer
 
-from tsic.storage import database, maintenance, migrations
+from tsic import settings
+from tsic.storage import database, maintenance, migrations, summary
 
 db_app = typer.Typer(
     name="db",
@@ -50,3 +53,46 @@ def clean(
         typer.echo(f"已刪除 {symbol} 共 {deleted} 筆記錄。")
     finally:
         conn.close()
+
+
+def _human_size(num_bytes: int) -> str:
+    """Render a byte count as a short human-readable string (e.g. ``12.3 KB``)."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            precision = 0 if unit == "B" else 1
+            return f"{size:.{precision}f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+@db_app.command()
+def status(
+    db_path: Path | None = typer.Option(
+        None,
+        "--db",
+        "--db-path",
+        help="Override the database path (defaults to ~/.tsic/data.db).",
+    ),
+) -> None:
+    """Show a read-only overview of the local database."""
+    resolved = Path(db_path) if db_path is not None else settings.default_db_path()
+
+    conn = database.connect(db_path)
+    try:
+        migrations.migrate(conn)
+        symbols = summary.symbol_latest_dates(conn)
+    finally:
+        conn.close()
+
+    size_bytes = resolved.stat().st_size if resolved.exists() else 0
+    typer.echo(f"資料庫：{resolved}")
+    typer.echo(f"大小：{_human_size(size_bytes)}（{size_bytes} bytes）")
+
+    if not symbols:
+        typer.echo("目前 0 檔追蹤。")
+        return
+
+    typer.echo(f"追蹤股票數：{len(symbols)}")
+    for sym, latest in symbols:
+        typer.echo(f"  {sym}  最新資料日期：{latest}")
