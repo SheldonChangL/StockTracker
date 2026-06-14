@@ -39,3 +39,16 @@
   - `timeout` 預設 `None`（不限時）為可選保護，避免硬塞魔術數字。
 - 限制：未接 CLI `fetch` 指令（本故事為 prereq，wiring 留待後續故事）；
   僅實作 `fetch_prices`，chips/fundamentals 編排不在本故事範圍。
+
+## Story 3.8 — tsic fetch（已完成 2026-06-14）
+- [x] 新增 `commandline/fetch_cmd.py`：解析代號（positional / --file / --all）、開 db、驅動 FetchOrchestrator、印摘要、退出碼
+- [x] `app.py` 以真實命令取代 fetch stub
+- [x] `database.connect` 加 `check_same_thread` 參數（orchestrator 跨執行緒共用單一連線必需）
+- [x] `tests/test_fetch_cmd.py` 覆蓋 AC-1..AC-5 + 邊界
+- [x] 更新 test_cli 的 quiet stub 測試改用 query
+- 驗證：142 passed、ruff 全過、`python -m tsic fetch --help` 正常
+
+### 設計決策
+- `--all` 的「追蹤清單」採用與 `db status` 一致的定義（summary.symbol_latest_dates，即 db 內已有資料的代號），因 watchlist 表目前無任何寫入路徑。
+- 退出碼：全部失敗才回 1；部分失敗回 0。
+- `--start` 預設今日往前 365 天、`--end` 預設今日；新代號回補用，既有代號由 orchestrator 從 MAX(date)+1 續抓。
