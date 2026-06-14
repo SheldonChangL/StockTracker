@@ -10,10 +10,10 @@ environment.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import typer
 
-from tsic import __version__
 from tsic.commandline.analyze_cmd import analyze as analyze_command
 from tsic.commandline.db_cmd import db_app
 from tsic.commandline.fetch_cmd import fetch as fetch_command
@@ -55,13 +55,6 @@ def main_callback(
     ctx.obj = GlobalOptions(quiet=quiet, verbose=verbose)
 
 
-def _stub(ctx: typer.Context, name: str) -> None:
-    """Emit a placeholder notice for a not-yet-implemented subcommand."""
-    opts: GlobalOptions = ctx.obj or GlobalOptions()
-    if not opts.quiet:
-        typer.echo(f"tsic {name}: not implemented yet (v{__version__}).")
-
-
 #: ``tsic fetch`` is delivered by its own module (Story 3.8); register it here.
 app.command(name="fetch")(fetch_command)
 
@@ -83,9 +76,18 @@ app.add_typer(schedule_app, name="schedule")
 
 
 @app.command()
-def tui(ctx: typer.Context) -> None:
-    """Launch the interactive terminal UI."""
-    _stub(ctx, "tui")
+def tui(
+    db_path: Path | None = typer.Option(
+        None,
+        "--db",
+        "--db-path",
+        help="覆寫資料庫路徑（預設 ~/.tsic/data.db）。",
+    ),
+) -> None:
+    """Launch the interactive terminal UI (Story 8.4, FR-26/FR-29)."""
+    from tsic.tui.launcher import launch
+
+    launch(db_path)
 
 
 def get_app() -> typer.Typer:

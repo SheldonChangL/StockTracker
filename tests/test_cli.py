@@ -47,8 +47,13 @@ def test_global_flags_visible_in_help() -> None:
     assert "--verbose" in result.stdout
 
 
-def test_quiet_suppresses_stub_output() -> None:
-    """--quiet suppresses the stub notice for a not-yet-implemented subcommand."""
-    result = runner.invoke(app, ["--quiet", "tui"])
+def test_tui_help_shows_db_option() -> None:
+    """``tui --help`` exits 0 and documents the shared --db option (Story 8.4).
+
+    ``tui`` now launches the interactive app rather than printing a stub, so its
+    headless launch is verified in :mod:`tests.test_tui_keys` (AC-4); here we
+    only confirm the command is wired with its option, without starting the app.
+    """
+    result = runner.invoke(app, ["tui", "--help"])
     assert result.exit_code == 0
-    assert result.stdout.strip() == ""
+    assert "--db" in result.stdout
