@@ -18,6 +18,7 @@ from tsic.commandline.analyze_cmd import analyze as analyze_command
 from tsic.commandline.db_cmd import db_app
 from tsic.commandline.fetch_cmd import fetch as fetch_command
 from tsic.commandline.query_cmd import query as query_command
+from tsic.commandline.schedule_cmd import schedule_app
 from tsic.commandline.watch_cmd import watch_app
 
 #: Help text shown at the root of the command tree.
@@ -77,10 +78,8 @@ app.add_typer(db_app, name="db")
 app.add_typer(watch_app, name="watch")
 
 
-@app.command()
-def schedule(ctx: typer.Context) -> None:
-    """Manage scheduled jobs."""
-    _stub(ctx, "schedule")
+#: ``tsic schedule`` is delivered by its own module (Story 7.3); register it here.
+app.add_typer(schedule_app, name="schedule")
 
 
 @app.command()
