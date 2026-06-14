@@ -22,8 +22,9 @@ for OHLCV records (Story 2.4, FR-11/FR-12):
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 
-from tsic.models import DailyPrice
+from tsic.models import DailyPrice, WatchlistEntry
 
 #: Columns of ``daily_prices`` in DDL order (see ``schema.sql``).
 _COLUMNS = (
@@ -162,3 +163,61 @@ class PriceRepository:
     def _as_params(price: DailyPrice) -> dict[str, object]:
         """Map a :class:`~tsic.models.DailyPrice` to named-bind parameters."""
         return {name: getattr(price, name) for name in _COLUMNS}
+
+
+class WatchlistRepository:
+    """CRUD access to the ``watchlist`` table over an open connection.
+
+    The watchlist is the user's set of tracked symbols, shared by the CLI and
+    the TUI (Story 6.1, FR-22). Like :class:`PriceRepository`, this class does
+    not own the connection lifecycle: the caller passes a connection already
+    migrated via :func:`tsic.storage.migrations.migrate`.
+
+    Adds are idempotent (first-write-wins on the ``symbol`` primary key), so
+    re-adding a symbol neither duplicates the row nor rewrites its original
+    ``added_at``. Removing a symbol that is not present is a harmless no-op.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def add(self, symbol: str) -> None:
+        """Add ``symbol`` to the watchlist, stamping the current time.
+
+        Uses ``INSERT OR IGNORE`` on the ``symbol`` primary key: a symbol that
+        is already tracked is left untouched, keeping its first ``added_at``
+        rather than refreshing it.
+
+        Args:
+            symbol: The symbol to track.
+        """
+        added_at = datetime.now(tz=UTC).isoformat()
+        self._conn.execute(
+            "INSERT OR IGNORE INTO watchlist (symbol, added_at) VALUES (?, ?)",
+            (symbol, added_at),
+        )
+        self._conn.commit()
+
+    def remove(self, symbol: str) -> None:
+        """Remove ``symbol`` from the watchlist if present.
+
+        Removing a symbol that is not tracked affects no rows and raises no
+        error, so callers can remove unconditionally.
+
+        Args:
+            symbol: The symbol to stop tracking.
+        """
+        self._conn.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol,))
+        self._conn.commit()
+
+    def list(self) -> list[WatchlistEntry]:
+        """Return all tracked symbols, oldest first.
+
+        Returns:
+            The watchlist entries ordered by ``added_at`` ascending (ties broken
+            by ``symbol``) so the output is stable.
+        """
+        rows = self._conn.execute(
+            "SELECT symbol, added_at FROM watchlist ORDER BY added_at ASC, symbol ASC"
+        ).fetchall()
+        return [WatchlistEntry(symbol=row[0], added_at=row[1]) for row in rows]
