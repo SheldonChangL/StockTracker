@@ -15,6 +15,7 @@ import typer
 
 from tsic import __version__
 from tsic.commandline.db_cmd import db_app
+from tsic.commandline.fetch_cmd import fetch as fetch_command
 
 #: Help text shown at the root of the command tree.
 _ROOT_HELP = "tsic — StockTracker interactive console."
@@ -57,10 +58,8 @@ def _stub(ctx: typer.Context, name: str) -> None:
         typer.echo(f"tsic {name}: not implemented yet (v{__version__}).")
 
 
-@app.command()
-def fetch(ctx: typer.Context) -> None:
-    """Fetch market data from upstream sources."""
-    _stub(ctx, "fetch")
+#: ``tsic fetch`` is delivered by its own module (Story 3.8); register it here.
+app.command(name="fetch")(fetch_command)
 
 
 @app.command()

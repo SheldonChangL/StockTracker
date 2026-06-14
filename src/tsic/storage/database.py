@@ -35,7 +35,9 @@ _BUSY_TIMEOUT_MS = 5000
 _IS_POSIX = os.name == "posix"
 
 
-def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
+def connect(
+    db_path: str | Path | None = None, *, check_same_thread: bool = True
+) -> sqlite3.Connection:
     """Open the local SQLite database, initializing it on first use.
 
     Args:
@@ -43,6 +45,11 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
             :func:`tsic.settings.default_db_path`. The literal ``":memory:"``
             opens a transient in-memory database (no directory or file is
             created, and no permission handling is applied).
+        check_same_thread: Passed through to :func:`sqlite3.connect`. The
+            default ``True`` keeps the standard single-thread guard. Callers
+            that share one connection across worker threads — e.g. the
+            :class:`~tsic.fetching.orchestrator.FetchOrchestrator`, which
+            serializes access behind its own lock under WAL — pass ``False``.
 
     Returns:
         An open :class:`sqlite3.Connection` configured for WAL mode.
@@ -51,7 +58,7 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
         db_path = settings.default_db_path()
 
     if _is_memory(db_path):
-        conn = sqlite3.connect(MEMORY_PATH)
+        conn = sqlite3.connect(MEMORY_PATH, check_same_thread=check_same_thread)
         _apply_pragmas(conn)
         return conn
 
@@ -59,7 +66,7 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     newly_created = not path.exists()
 
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), check_same_thread=check_same_thread)
     _apply_pragmas(conn)
 
     if _IS_POSIX:
