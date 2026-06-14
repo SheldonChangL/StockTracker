@@ -49,6 +49,6 @@ def test_global_flags_visible_in_help() -> None:
 
 def test_quiet_suppresses_stub_output() -> None:
     """--quiet suppresses the stub notice for a not-yet-implemented subcommand."""
-    result = runner.invoke(app, ["--quiet", "analyze"])
+    result = runner.invoke(app, ["--quiet", "watch"])
     assert result.exit_code == 0
     assert result.stdout.strip() == ""

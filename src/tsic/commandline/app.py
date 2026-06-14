@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import typer
 
 from tsic import __version__
+from tsic.commandline.analyze_cmd import analyze as analyze_command
 from tsic.commandline.db_cmd import db_app
 from tsic.commandline.fetch_cmd import fetch as fetch_command
 from tsic.commandline.query_cmd import query as query_command
@@ -65,11 +66,8 @@ app.command(name="fetch")(fetch_command)
 #: ``tsic query`` is delivered by its own module (Story 4.2); register it here.
 app.command(name="query")(query_command)
 
-
-@app.command()
-def analyze(ctx: typer.Context) -> None:
-    """Run analysis over stored data."""
-    _stub(ctx, "analyze")
+#: ``tsic analyze`` is delivered by its own module (Story 5.4); register it here.
+app.command(name="analyze")(analyze_command)
 
 
 app.add_typer(db_app, name="db")
