@@ -53,7 +53,9 @@ def test_fetch_prices_downloads_raw_unadjusted_single_threaded() -> None:
 
     assert len(downloader.calls) == 1
     call = downloader.calls[0]
-    assert call["symbol"] == "2330"
+    # Yahoo keys listed TW stocks under a .TW suffix; the bare code returns
+    # no data (see _to_yahoo_symbol).
+    assert call["symbol"] == "2330.TW"
     assert call["start"] == "2026-06-10"
     assert call["end"] == "2026-06-11"
     assert call["auto_adjust"] is False
@@ -78,6 +80,50 @@ def test_parser_emits_raw_yfinance_daily_prices() -> None:
     assert first.low == 99.0
     assert first.close == 104.0  # raw close, NOT the 103.2 adj close
     assert first.volume == 12000
+
+
+def test_bare_tw_code_is_downloaded_with_tw_suffix_but_stored_bare() -> None:
+    # The download call must use the .TW ticker, while the stored DailyPrice
+    # keeps the original bare code so the cache is keyed consistently.
+    downloader = _RecordingDownloader(_recorded_frame())
+    source = YfinanceSource(download_fn=downloader, sleep_fn=_no_sleep)
+
+    prices = source.fetch_prices("2330", "2026-06-10", "2026-06-11")
+
+    assert downloader.calls[0]["symbol"] == "2330.TW"
+    assert all(p.symbol == "2330" for p in prices)
+
+
+def test_symbol_with_existing_suffix_is_left_untouched() -> None:
+    downloader = _RecordingDownloader(_recorded_frame())
+    source = YfinanceSource(download_fn=downloader, sleep_fn=_no_sleep)
+
+    source.fetch_prices("2330.TWO", "2026-06-10", "2026-06-11")
+
+    assert [c["symbol"] for c in downloader.calls] == ["2330.TWO"]
+
+
+def test_otc_code_falls_back_from_tw_to_two_when_tw_is_empty() -> None:
+    # An OTC/TPEx code (e.g. 2255) has no .TW listing; yfinance returns an
+    # empty frame for .TW, so the source must retry with .TWO and keep that.
+    frame = _recorded_frame()
+
+    class _PerSuffixDownloader:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def __call__(self, symbol: str, **kwargs: object) -> pd.DataFrame:
+            self.calls.append({"symbol": symbol, **kwargs})
+            return frame if symbol.endswith(".TWO") else pd.DataFrame()
+
+    downloader = _PerSuffixDownloader()
+    source = YfinanceSource(download_fn=downloader, sleep_fn=_no_sleep)
+
+    prices = source.fetch_prices("2255", "2026-06-10", "2026-06-11")
+
+    assert [c["symbol"] for c in downloader.calls] == ["2255.TW", "2255.TWO"]
+    assert len(prices) == 2
+    assert all(p.symbol == "2255" for p in prices)
 
 
 def test_parser_handles_multiindex_columns() -> None:

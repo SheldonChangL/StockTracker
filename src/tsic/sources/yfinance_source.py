@@ -78,8 +78,15 @@ class YfinanceSource(BaseSource):
         Raises:
             SourceFetchError: If the download fails on every attempt (AC-3).
         """
-        frame = self._download_with_retry(symbol, start, end)
-        return _parse_prices(frame, symbol)
+        # A bare Taiwan code maps to two possible Yahoo tickers — ``.TW``
+        # (listed/TWSE) and ``.TWO`` (OTC/TPEx) — and the code alone can't tell
+        # them apart. Try each in turn and keep the first that returns data.
+        for yahoo_symbol in _yahoo_candidates(symbol):
+            frame = self._download_with_retry(yahoo_symbol, start, end)
+            prices = _parse_prices(frame, symbol)
+            if prices:
+                return prices
+        return []
 
     def _download_with_retry(self, symbol: str, start: str, end: str) -> Any:
         """Call ``download_fn`` with raw-price flags, retrying with backoff (AC-3)."""
@@ -123,6 +130,22 @@ class YfinanceSource(BaseSource):
     ) -> list[Fundamental]:
         """Not supported by this story; fundamentals come from other sources."""
         raise NotImplementedError("yfinance fundamentals are out of scope")
+
+
+def _yahoo_candidates(symbol: str) -> list[str]:
+    """Yahoo Finance tickers to try, in order, for a Taiwan stock ``symbol``.
+
+    Yahoo keys Taiwan stocks under a market suffix the bare code lacks: ``.TW``
+    for listed (TWSE) and ``.TWO`` for OTC (TPEx). A bare numeric code returns
+    no data and looks "delisted", and the code alone can't tell the two markets
+    apart — so we return both, listed first. A symbol that already carries a
+    suffix (``2330.TW``, ``2330.TWO``) or is non-numeric (foreign tickers) is
+    used as-is. The stored ``DailyPrice.symbol`` keeps the original bare code —
+    this mapping affects only the download call.
+    """
+    if symbol.isdigit():
+        return [f"{symbol}.TW", f"{symbol}.TWO"]
+    return [symbol]
 
 
 def _parse_prices(frame: Any, symbol: str) -> list[DailyPrice]:
