@@ -35,8 +35,11 @@ from typing import Protocol
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import VerticalScroll
 from textual.message import Message
-from textual.widgets import DataTable, Footer, Header, ProgressBar
+from textual.screen import Screen
+from textual.widgets import DataTable, Footer, Header, Markdown, ProgressBar, Static
+from textual.worker import WorkerState
 
 from tsic.fetching.orchestrator import FetchSummary
 from tsic.tui.watchlist_view import COLUMNS, WatchlistSource
@@ -46,6 +49,14 @@ WATCHLIST_TABLE_ID = "watchlist-table"
 
 #: Stable ``id`` for the background-update progress bar (Story 8.3, AC-1).
 PROGRESS_BAR_ID = "progress-bar"
+
+#: Stable ``id`` for the one-line status banner under the table. It is the app's
+#: single feedback surface: idle hint, empty-watchlist guidance, in-flight update
+#: progress, and post-action results all render here so no action looks like a no-op.
+STATUS_LABEL_ID = "status-line"
+
+#: Shown when the watchlist is empty so the screen is never a blank, silent table.
+EMPTY_WATCHLIST_HINT = "觀察清單是空的 — 先按 q 離開，執行 `tsic watch add <代號>` 加入股票後再回來。"
 
 
 class UpdateRunner(Protocol):
@@ -81,6 +92,34 @@ class Analyzer(Protocol):
     def analyze(self, symbol: str) -> str:
         """Return the AI analysis for ``symbol`` (blocking; run on a worker)."""
         ...
+
+
+class AnalysisScreen(Screen):
+    """A full-screen, scrollable view of one symbol's AI analysis.
+
+    Pressing ``a`` runs a blocking AI CLI whose output is otherwise invisible to
+    the user; this screen renders that output as Markdown so the result of the
+    action is actually seen. ``escape``/``q`` returns to the watchlist.
+    """
+
+    BINDINGS = [
+        Binding("escape", "back", "返回"),
+        Binding("q", "back", "返回"),
+    ]
+
+    def __init__(self, symbol: str, output: str) -> None:
+        super().__init__()
+        self._symbol = symbol
+        self._output = output
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield VerticalScroll(Markdown(f"# {self._symbol} 分析\n\n{self._output}"))
+        yield Footer()
+
+    def action_back(self) -> None:
+        """Return to the watchlist screen."""
+        self.app.pop_screen()
 
 
 class TsicApp(App):
@@ -158,18 +197,47 @@ class TsicApp(App):
         self.last_analysis: TsicApp.AnalysisReady | None = None
 
     def compose(self) -> ComposeResult:
-        """Lay out the header, the watchlist table, the progress bar, the footer."""
+        """Lay out the header, the watchlist table, the status line, the bar, the footer."""
         yield Header()
         yield DataTable(id=WATCHLIST_TABLE_ID)
+        yield Static(id=STATUS_LABEL_ID)
         yield ProgressBar(id=PROGRESS_BAR_ID, show_eta=False)
         yield Footer()
 
     def on_mount(self) -> None:
-        """Populate the table's columns and rows from the data source."""
+        """Populate the table and start in a clean, idle state (no fake loading).
+
+        The progress bar is hidden until an update actually runs — left visible
+        with no ``total`` it pulses indefinitely and reads as a stuck spinner.
+        """
+        self._populate_rows()
+        self.query_one(f"#{PROGRESS_BAR_ID}", ProgressBar).display = False
+        self._set_idle_status()
+
+    def _populate_rows(self) -> None:
+        """Fill the table's columns (once) and rows from the data source."""
         table = self.query_one(f"#{WATCHLIST_TABLE_ID}", DataTable)
-        table.add_columns(*COLUMNS)
+        if not table.columns:
+            table.add_columns(*COLUMNS)
         for row in self._repo.watchlist_rows():
             table.add_row(*row.cells())
+
+    def _refresh_rows(self) -> None:
+        """Re-read the data source and redraw the rows (after an update lands)."""
+        self.query_one(f"#{WATCHLIST_TABLE_ID}", DataTable).clear()
+        self._populate_rows()
+
+    def _set_status(self, text: str) -> None:
+        """Write the one-line status banner under the table."""
+        self.query_one(f"#{STATUS_LABEL_ID}", Static).update(text)
+
+    def _set_idle_status(self) -> None:
+        """Show the empty-watchlist hint, or a brief ready line when there are rows."""
+        table = self.query_one(f"#{WATCHLIST_TABLE_ID}", DataTable)
+        if table.row_count == 0:
+            self._set_status(EMPTY_WATCHLIST_HINT)
+        else:
+            self._set_status(f"追蹤 {table.row_count} 檔　·　a 分析　u 全部更新　f 更新選取")
 
     def action_update(self) -> None:
         """Update *every* injected symbol on a threaded worker (Story 8.3, ``u``).
@@ -179,6 +247,7 @@ class TsicApp(App):
         in-flight update. A no-op when no orchestrator/symbols were injected.
         """
         if not self._symbols:
+            self._set_status(EMPTY_WATCHLIST_HINT)
             return
         self._start_fetch(self._symbols)
 
@@ -203,6 +272,10 @@ class TsicApp(App):
         if self._orchestrator is None or self._date_range is None:
             return
         fetch_symbols = list(symbols)
+        bar = self.query_one(f"#{PROGRESS_BAR_ID}", ProgressBar)
+        bar.update(total=len(fetch_symbols), progress=0)
+        bar.display = True
+        self._set_status(f"更新中… 0/{len(fetch_symbols)}")
         self.run_worker(
             lambda: self._fetch(fetch_symbols),
             thread=True,
@@ -234,10 +307,12 @@ class TsicApp(App):
         the watchlist is empty.
         """
         if self._analyzer is None:
+            self._set_status("找不到 AI CLI，無法分析（需安裝可用的 AI 指令）。")
             return
         symbol = self._selected_symbol()
         if symbol is None:
             return
+        self._set_status(f"分析 {symbol} 中…")
         self.run_worker(
             lambda: self._run_analyze(symbol),
             thread=True,
@@ -264,10 +339,28 @@ class TsicApp(App):
         return str(table.get_row_at(table.cursor_row)[0])
 
     def on_tsic_app_update_progress(self, message: TsicApp.UpdateProgress) -> None:
-        """Advance the progress bar from a worker progress event (AC-3)."""
+        """Advance the progress bar and status line from a worker event (AC-3)."""
         bar = self.query_one(f"#{PROGRESS_BAR_ID}", ProgressBar)
         bar.update(total=message.total, progress=message.completed)
+        self._set_status(f"更新中… {message.completed}/{message.total}")
 
     def on_tsic_app_analysis_ready(self, message: TsicApp.AnalysisReady) -> None:
-        """Store the latest AI analysis so it is observable from a test (AC-2)."""
+        """Store the latest AI analysis (AC-2) and show it on a scrollable screen."""
         self.last_analysis = message
+        self._set_status(f"{message.symbol} 分析完成")
+        self.push_screen(AnalysisScreen(message.symbol, message.output))
+
+    def on_worker_state_changed(self, event: object) -> None:
+        """When a background update finishes, redraw the table with the new data.
+
+        Without this the table keeps showing pre-fetch values and ``u``/``f`` look
+        like no-ops. The analyze worker reports its result via a message instead,
+        so only the ``update`` group refreshes rows here.
+        """
+        worker = getattr(event, "worker", None)
+        state = getattr(event, "state", None)
+        if worker is None or state is not WorkerState.SUCCESS:
+            return
+        if worker.group == "update":
+            self._refresh_rows()
+            self._set_status("更新完成 ✓")
