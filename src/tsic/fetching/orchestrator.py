@@ -248,6 +248,7 @@ class FetchOrchestrator:
             return FetchResult(symbol=symbol, success=True, rows=0, message=message)
 
         errors: list[str] = []
+        empty_note: str | None = None
         for source in self._sources:
             if not getattr(source, "available", True):
                 errors.append(f"{source.name}: unavailable, skipped")
@@ -261,7 +262,16 @@ class FetchOrchestrator:
                 errors.append(reason)
                 continue
 
-            # The source answered: validate, persist, and stop falling back.
+            # A source that returns nothing simply has no data for this symbol
+            # (e.g. yfinance lacks a ``.TW``/``.TWO`` listing); fall back to the
+            # next source instead of masking the gap as "up to date". Remember
+            # it so an all-empty run reports a clean skip, not a failure.
+            if not fetched:
+                empty_note = f"{symbol}: no data from {source.name}"
+                logger.info(empty_note)
+                continue
+
+            # The source answered with data: validate, persist, stop falling back.
             validation = self._validate(fetched)
             for warning in validation.warnings:
                 logger.warning(warning)
@@ -293,6 +303,18 @@ class FetchOrchestrator:
                 success=True,
                 rows=0,
                 message=message,
+                errors=errors,
+            )
+
+        # Every source is exhausted. If at least one answered (with no data),
+        # that is a clean skip — the symbol simply has nothing in this range.
+        # Only if every source errored/was unavailable is it a real failure.
+        if empty_note is not None:
+            return FetchResult(
+                symbol=symbol,
+                success=True,
+                rows=0,
+                message=empty_note,
                 errors=errors,
             )
 

@@ -215,6 +215,37 @@ def test_skipped_when_source_returns_no_rows() -> None:
     assert summary.success_count == 0
 
 
+# AC-1: an empty (no-data) higher-priority source must fall back, not skip.
+def test_empty_source_falls_back_to_next_source() -> None:
+    repo = FakeRepo()
+    # The preferred source has no data for this symbol (e.g. yfinance with no
+    # .TW/.TWO listing); a lower-priority source does.
+    empty = FakeSource("empty", 1, prices=[])
+    backup = FakeSource("backup", 2, prices=[_price("2026-06-10")])
+    orch = FetchOrchestrator([empty, backup], repo)
+
+    summary = orch.fetch_prices(["2330"], "2026-06-01", "2026-06-30")
+
+    assert summary.success_count == 1
+    (result,) = summary.succeeded
+    assert result.source == "backup"
+    assert result.rows == 1
+    assert empty.calls and backup.calls  # the empty source was tried first
+
+
+# All sources empty (none has data) is a clean skip, not a failure.
+def test_all_empty_sources_report_skip_not_failure() -> None:
+    repo = FakeRepo()
+    orch = FetchOrchestrator(
+        [FakeSource("a", 1, prices=[]), FakeSource("b", 2, prices=[])], repo
+    )
+
+    summary = orch.fetch_prices(["2330"], "2026-06-01", "2026-06-30")
+
+    assert summary.skipped_count == 1
+    assert summary.failed_count == 0
+
+
 # AC-4: concurrency uses a sized pool; a per-future timeout protects the batch.
 def test_timeout_does_not_stall_batch() -> None:
     repo = FakeRepo()
