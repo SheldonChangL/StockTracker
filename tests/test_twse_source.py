@@ -225,3 +225,160 @@ def test_concurrency_and_rate_limit_match_twse_budget() -> None:
     assert source.concurrency == 1
     assert source.rate_limit == 1.0
     assert source.bucket.rate == 1.0
+
+
+# --- Story 3.4: T86 institutional net-flows (籌碼面) --------------------------
+
+
+def _t86_payload() -> dict[str, object]:
+    """A small T86 OK payload in the modern split-column layout (ROC numbers).
+
+    外資 is split into 外陸資 + 外資自營商, and 自營商 into 自行買賣 + 避險, so the
+    parser must sum the sub-columns to recover the aggregate net flow.
+    """
+    return {
+        "stat": "OK",
+        "date": "20260610",
+        "fields": [
+            "證券代號",
+            "證券名稱",
+            "外陸資買賣超股數(不含外資自營商)",
+            "外資自營商買賣超股數",
+            "投信買賣超股數",
+            "自營商買賣超股數(自行買賣)",
+            "自營商買賣超股數(避險)",
+            "三大法人買賣超股數",
+        ],
+        "data": [
+            # 2330: foreign = 10,000 + 2,000 = 12,000; trust = -3,000;
+            #       dealer = 1,500 + (-500) = 1,000.
+            ["2330", "台積電", "10,000", "2,000", "-3,000", "1,500", "-500", "9,000"],
+            ["2317", "鴻海", "-5,000", "0", "1,000", "-200", "0", "-4,200"],
+        ],
+    }
+
+
+class _T86Fetcher:
+    """Returns a per-date T86 payload keyed by the ``date=YYYYMMDD`` URL param."""
+
+    def __init__(self, by_date: dict[str, object]) -> None:
+        self._by_date = by_date
+        self.urls: list[str] = []
+
+    def __call__(self, url: str) -> _FakeResponse:
+        self.urls.append(url)
+        for ymd, payload in self._by_date.items():
+            if f"date={ymd}" in url:
+                return _FakeResponse(payload)
+        # Any other day has no report (weekend/holiday).
+        return _FakeResponse({"stat": "很抱歉，沒有符合條件的資料!"})
+
+
+# AC-1: a T86 payload parses into a twse-sourced ChipFlow with signed nets.
+def test_fetch_chips_parses_signed_chipflow() -> None:
+    fetcher = _T86Fetcher({"20260610": _t86_payload()})
+    source = TwseSource(fetch_fn=fetcher, sleep_fn=_no_sleep)
+
+    flows = source.fetch_chips("2330", "2026-06-10", "2026-06-10")
+
+    assert len(flows) == 1
+    (flow,) = flows
+    assert flow.symbol == "2330"
+    assert flow.date == "2026-06-10"
+    assert flow.source == "twse"
+    assert flow.foreign_net == 12000  # 10,000 + 2,000, separators stripped
+    assert flow.trust_net == -3000  # negative preserved
+    assert flow.dealer_net == 1000  # 1,500 + (-500)
+
+
+# AC-1: the legacy aggregate layout (single 外資/自營商 column) also parses.
+def test_fetch_chips_parses_legacy_aggregate_layout() -> None:
+    payload = {
+        "stat": "OK",
+        "fields": [
+            "證券代號",
+            "證券名稱",
+            "外資買賣超股數",
+            "投信買賣超股數",
+            "自營商買賣超股數",
+            "三大法人買賣超股數",
+        ],
+        "data": [["2330", "台積電", "12,000", "-3,000", "1,000", "10,000"]],
+    }
+    source = TwseSource(fetch_fn=_T86Fetcher({"20260610": payload}), sleep_fn=_no_sleep)
+
+    (flow,) = source.fetch_chips("2330", "2026-06-10", "2026-06-10")
+
+    assert (flow.foreign_net, flow.trust_net, flow.dealer_net) == (12000, -3000, 1000)
+
+
+# AC-2: a day with no report (non-OK payload) is skipped, not raised.
+def test_fetch_chips_skips_no_data_day() -> None:
+    source = TwseSource(fetch_fn=_T86Fetcher({}), sleep_fn=_no_sleep)
+    assert source.fetch_chips("2330", "2026-06-13", "2026-06-14") == []
+
+
+# AC-2: a day whose data omits the symbol is skipped, others still parse.
+def test_fetch_chips_skips_days_without_symbol_row() -> None:
+    fetcher = _T86Fetcher(
+        {
+            "20260610": _t86_payload(),  # has 2330
+            "20260611": {  # OK day, but 2330 not listed
+                "stat": "OK",
+                "fields": [
+                    "證券代號",
+                    "證券名稱",
+                    "外資買賣超股數",
+                    "投信買賣超股數",
+                    "自營商買賣超股數",
+                ],
+                "data": [["2317", "鴻海", "1,000", "0", "0"]],
+            },
+        }
+    )
+    source = TwseSource(fetch_fn=fetcher, sleep_fn=_no_sleep)
+
+    flows = source.fetch_chips("2330", "2026-06-10", "2026-06-11")
+
+    assert [f.date for f in flows] == ["2026-06-10"]
+
+
+# AC-3: one request per calendar day in range, against the T86 endpoint.
+def test_fetch_chips_issues_one_request_per_day() -> None:
+    fetcher = _T86Fetcher({"20260610": _t86_payload()})
+    source = TwseSource(fetch_fn=fetcher, sleep_fn=_no_sleep)
+
+    source.fetch_chips("2330", "2026-06-10", "2026-06-12")
+
+    assert len(fetcher.urls) == 3  # 10th, 11th, 12th
+    for url in fetcher.urls:
+        assert "T86" in url
+        assert "selectType=ALL" in url
+    assert "date=20260610" in fetcher.urls[0]
+    assert "date=20260612" in fetcher.urls[2]
+
+
+# AC-3: chip fetches reuse the same shared bucket + 429 retry path as prices.
+def test_fetch_chips_retries_429_via_shared_bucket() -> None:
+    payload = _t86_payload()
+    attempts = {"n": 0}
+
+    def flaky(url: str) -> _FakeResponse:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            return _FakeResponse(None, status_code=429)
+        return _FakeResponse(payload)
+
+    slept: list[float] = []
+    source = TwseSource(fetch_fn=flaky, sleep_fn=slept.append)
+    acquisitions: list[float] = []
+    original_acquire = source.bucket.acquire
+    source.bucket.acquire = lambda *a, **k: (  # type: ignore[method-assign]
+        acquisitions.append(1.0) or original_acquire(*a, **k)
+    )
+
+    flows = source.fetch_chips("2330", "2026-06-10", "2026-06-10")
+
+    assert len(flows) == 1
+    assert slept == [1.0, 2.0]  # doubling backoff shared with prices
+    assert len(acquisitions) == 3  # bucket acquired before every attempt
