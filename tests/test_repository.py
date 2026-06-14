@@ -7,9 +7,13 @@ from collections.abc import Iterator
 
 import pytest
 
-from tsic.models import DailyPrice
+from tsic.models import ChipFlow, DailyPrice
 from tsic.storage import migrations
-from tsic.storage.repository import DataPollutionError, PriceRepository
+from tsic.storage.repository import (
+    ChipRepository,
+    DataPollutionError,
+    PriceRepository,
+)
 
 
 @pytest.fixture
@@ -177,3 +181,50 @@ def test_query_prices_round_trips_all_columns(repo: PriceRepository) -> None:
 
     (restored,) = repo.query_prices("2330", "2026-06-10", "2026-06-10")
     assert restored == original
+
+
+# --- ChipRepository (籌碼面) ------------------------------------------------
+
+
+@pytest.fixture
+def chips() -> Iterator[ChipRepository]:
+    conn = sqlite3.connect(":memory:")
+    migrations.migrate(conn)
+    try:
+        yield ChipRepository(conn)
+    finally:
+        conn.close()
+
+
+def _chip(symbol: str = "2330", date: str = "2026-06-10", foreign: int = 100) -> ChipFlow:
+    return ChipFlow(
+        symbol=symbol,
+        date=date,
+        foreign_net=foreign,
+        trust_net=10,
+        dealer_net=-5,
+        source="twse",
+    )
+
+
+def test_chip_duplicate_key_is_ignored_first_write_wins(chips: ChipRepository) -> None:
+    assert chips.upsert_chips([_chip(foreign=100)]) == 1
+    # Same (symbol, date) with a different value is silently skipped.
+    assert chips.upsert_chips([_chip(foreign=999)]) == 0
+
+    (row,) = chips.query_chips("2330", "2026-06-10", "2026-06-10")
+    assert row.foreign_net == 100
+
+
+def test_chip_query_range_is_ordered_and_inclusive(chips: ChipRepository) -> None:
+    chips.upsert_chips(
+        [_chip(date="2026-06-12"), _chip(date="2026-06-10"), _chip(date="2026-06-11")]
+    )
+    rows = chips.query_chips("2330", "2026-06-10", "2026-06-11")
+    assert [r.date for r in rows] == ["2026-06-10", "2026-06-11"]
+
+
+def test_latest_chip_date_reports_max_or_none(chips: ChipRepository) -> None:
+    assert chips.latest_chip_date("2330") is None
+    chips.upsert_chips([_chip(date="2026-06-10"), _chip(date="2026-06-13")])
+    assert chips.latest_chip_date("2330") == "2026-06-13"

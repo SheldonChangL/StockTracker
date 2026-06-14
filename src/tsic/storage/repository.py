@@ -24,7 +24,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 
-from tsic.models import DailyPrice, WatchlistEntry
+from tsic.models import ChipFlow, DailyPrice, WatchlistEntry
 
 #: Columns of ``daily_prices`` in DDL order (see ``schema.sql``).
 _COLUMNS = (
@@ -163,6 +163,77 @@ class PriceRepository:
     def _as_params(price: DailyPrice) -> dict[str, object]:
         """Map a :class:`~tsic.models.DailyPrice` to named-bind parameters."""
         return {name: getattr(price, name) for name in _COLUMNS}
+
+
+#: Columns of ``chip_flows`` in DDL order (see ``schema.sql``).
+_CHIP_COLUMNS = (
+    "symbol",
+    "date",
+    "foreign_net",
+    "trust_net",
+    "dealer_net",
+    "source",
+)
+
+_CHIP_INSERT_SQL = (
+    "INSERT OR IGNORE INTO chip_flows "
+    "(symbol, date, foreign_net, trust_net, dealer_net, source) "
+    "VALUES (:symbol, :date, :foreign_net, :trust_net, :dealer_net, :source)"
+)
+
+
+class ChipRepository:
+    """Read/write access to ``chip_flows`` (籌碼面) over an open connection.
+
+    Mirrors :class:`PriceRepository`'s incremental, first-write-wins contract on
+    the ``(symbol, date)`` primary key: re-running a chip fetch never duplicates
+    a row, :meth:`latest_chip_date` tells callers where to resume, and
+    :meth:`query_chips` serves an inclusive date range ordered by ``date``. The
+    caller owns the connection's lifecycle (already migrated via
+    :func:`tsic.storage.migrations.migrate`).
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def upsert_chips(self, chips: list[ChipFlow]) -> int:
+        """Insert chip rows, ignoring duplicate ``(symbol, date)`` keys.
+
+        First-write-wins: a row whose ``(symbol, date)`` already exists is left
+        untouched, so re-running a fetch is idempotent.
+
+        Args:
+            chips: Records to persist. An empty list is a no-op.
+
+        Returns:
+            The number of rows actually inserted (skipped duplicates do not count).
+        """
+        if not chips:
+            return 0
+        cursor = self._conn.executemany(
+            _CHIP_INSERT_SQL,
+            [{name: getattr(chip, name) for name in _CHIP_COLUMNS} for chip in chips],
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
+    def latest_chip_date(self, symbol: str) -> str | None:
+        """Return the most recent stored chip ``date`` for ``symbol``, or ``None``."""
+        row = self._conn.execute(
+            "SELECT MAX(date) FROM chip_flows WHERE symbol = ?", (symbol,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def query_chips(self, symbol: str, start: str, end: str) -> list[ChipFlow]:
+        """Return a symbol's chip rows within ``[start, end]``, ascending by date."""
+        rows = self._conn.execute(
+            "SELECT symbol, date, foreign_net, trust_net, dealer_net, source "
+            "FROM chip_flows "
+            "WHERE symbol = ? AND date BETWEEN ? AND ? "
+            "ORDER BY date ASC",
+            (symbol, start, end),
+        ).fetchall()
+        return [ChipFlow(**dict(zip(_CHIP_COLUMNS, row, strict=True))) for row in rows]
 
 
 class WatchlistRepository:

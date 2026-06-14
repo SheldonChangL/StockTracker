@@ -45,12 +45,18 @@ from datetime import date, timedelta
 from tsic.fetching.validator import BatchValidation, validate_prices
 from tsic.models import DailyPrice, FetchResult
 from tsic.sources.base import BaseSource
-from tsic.storage.repository import DataPollutionError, PriceRepository
+from tsic.storage.repository import ChipRepository, DataPollutionError, PriceRepository
 
 logger = logging.getLogger(__name__)
 
 #: Default number of symbols fetched concurrently (AC-4).
 _DEFAULT_CONCURRENCY = 3
+
+#: Default lookback (days) for the best-effort 籌碼面 fetch. Kept short on purpose:
+#: TWSE's T86 report is one HTTP request *per day*, so matching the 365-day price
+#: window would make every update minutes-long. 30 days covers the recent chip
+#: trend an analysis needs, and the fetch resumes incrementally from there.
+_DEFAULT_CHIP_HISTORY_DAYS = 30
 
 
 #: Write-time validator signature; injectable so tests can swap it out.
@@ -143,6 +149,12 @@ class FetchOrchestrator:
             stall the whole run (AC-4).
         validator: Write-time price validator; defaults to
             :func:`~tsic.fetching.validator.validate_prices`.
+        chip_repository: Optional store for 籌碼面 net-flows. When provided, each
+            symbol's recent chips are fetched best-effort alongside its prices
+            (see ``chip_history_days``) and persisted here; when ``None`` chip
+            fetching is disabled and behaviour is exactly the price-only path.
+        chip_history_days: Lookback window (days) for the chip fetch, counted back
+            from the batch ``end``. Defaults to :data:`_DEFAULT_CHIP_HISTORY_DAYS`.
     """
 
     def __init__(
@@ -153,12 +165,16 @@ class FetchOrchestrator:
         concurrency: int = _DEFAULT_CONCURRENCY,
         timeout: float | None = None,
         validator: Validator = validate_prices,
+        chip_repository: ChipRepository | None = None,
+        chip_history_days: int = _DEFAULT_CHIP_HISTORY_DAYS,
     ) -> None:
         self._sources: list[BaseSource] = sorted(sources, key=lambda s: s.priority)
         self._repository = repository
         self._concurrency = max(1, concurrency)
         self._timeout = timeout
         self._validate = validator
+        self._chip_repository = chip_repository
+        self._chip_history_days = max(0, chip_history_days)
         self._repo_lock = threading.Lock()
 
     def fetch_prices(
@@ -196,7 +212,7 @@ class FetchOrchestrator:
         executor = ThreadPoolExecutor(max_workers=self._concurrency)
         try:
             futures = {
-                executor.submit(self._fetch_symbol, symbol, start, end): symbol
+                executor.submit(self._fetch_one, symbol, start, end): symbol
                 for symbol in symbols
             }
             # Wait on each future with its own timeout so a single stuck symbol
@@ -234,6 +250,63 @@ class FetchOrchestrator:
             executor.shutdown(wait=False, cancel_futures=True)
 
         return FetchSummary(results)
+
+    def _fetch_one(self, symbol: str, start: str, end: str) -> FetchResult:
+        """Worker body: fetch a symbol's prices, then its chips best-effort.
+
+        The :class:`FetchResult` reflects the *price* outcome only; chip fetching
+        is a non-fatal companion (籌碼面 is supplementary), so any chip error is
+        logged and swallowed rather than dragging the symbol into "failed".
+        """
+        result = self._fetch_symbol(symbol, start, end)
+        if self._chip_repository is not None and self._chip_history_days > 0:
+            try:
+                self._fetch_chips_for_symbol(symbol, end)
+            except Exception as exc:  # noqa: BLE001 - chips are best-effort.
+                logger.warning("chip fetch for %s raised: %s", symbol, exc)
+        return result
+
+    def _fetch_chips_for_symbol(self, symbol: str, end: str) -> None:
+        """Fetch and store ``symbol``'s recent 籌碼面 net-flows (best-effort).
+
+        Resumes from ``MAX(chip date) + 1`` but never reaches further back than
+        ``chip_history_days`` before ``end``. Sources that do not provide chips
+        (every source but TWSE today) raise ``NotImplementedError`` and are
+        skipped; the first source that answers — even with no rows — ends the
+        fallback, mirroring the price path's "a source answered" semantics.
+        """
+        assert self._chip_repository is not None
+        start = self._resume_chip_start(symbol, end)
+        if start > end:
+            return
+        for source in self._sources:
+            if not getattr(source, "available", True):
+                continue
+            try:
+                chips = source.fetch_chips(symbol, start, end)
+            except NotImplementedError:
+                continue
+            except Exception as exc:  # noqa: BLE001 - upstream errors are opaque.
+                logger.warning(
+                    "chip fetch for %s via %s failed: %s", symbol, source.name, exc
+                )
+                continue
+            if chips:
+                with self._repo_lock:
+                    self._chip_repository.upsert_chips(chips)
+            return
+
+    def _resume_chip_start(self, symbol: str, end: str) -> str:
+        """Return the chip resume date: ``MAX(date)+1`` clamped to the window start."""
+        window_start = (
+            date.fromisoformat(end) - timedelta(days=self._chip_history_days)
+        ).isoformat()
+        with self._repo_lock:
+            latest = self._chip_repository.latest_chip_date(symbol)  # type: ignore[union-attr]
+        if latest is None:
+            return window_start
+        resume = (date.fromisoformat(latest) + timedelta(days=1)).isoformat()
+        return max(window_start, resume)
 
     def _fetch_symbol(self, symbol: str, start: str, end: str) -> FetchResult:
         """Fetch one symbol with source fallback; never raises for source errors.

@@ -34,7 +34,7 @@ from tsic.ai.detector import CLI_PRIORITY
 from tsic.ai.formatter import build_prompt, to_markdown
 from tsic.ai.pipe import resolve_agent_command, run
 from tsic.storage import database, migrations
-from tsic.storage.repository import PriceRepository
+from tsic.storage.repository import ChipRepository, PriceRepository
 
 #: Default inclusive range bounds when ``--start`` / ``--end`` are omitted. ISO
 #: date strings compare lexically, so these sentinels select every stored row;
@@ -107,6 +107,7 @@ def analyze(
     try:
         migrations.migrate(conn)
         rows = PriceRepository(conn).query_prices(symbol, start, end)
+        chips = ChipRepository(conn).query_chips(symbol, start, end)
     finally:
         conn.close()
 
@@ -119,7 +120,7 @@ def analyze(
     header_start = start if start != _MIN_DATE else None
     header_end = end if end != _MAX_DATE else None
 
-    markdown = to_markdown(symbol, rows, start=header_start, end=header_end)
+    markdown = to_markdown(symbol, rows, chips, start=header_start, end=header_end)
     instruction = build_prompt(symbol, prompt)
     payload = f"{instruction}\n\n{markdown}"
 

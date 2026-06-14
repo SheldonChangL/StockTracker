@@ -31,7 +31,11 @@ from tsic.ai.pipe import Runner, resolve_agent_command, run
 from tsic.fetching.orchestrator import FetchOrchestrator
 from tsic.sources import TwseSource, YfinanceSource
 from tsic.storage import database, migrations
-from tsic.storage.repository import PriceRepository, WatchlistRepository
+from tsic.storage.repository import (
+    ChipRepository,
+    PriceRepository,
+    WatchlistRepository,
+)
 from tsic.tui.app import TsicApp
 from tsic.tui.watchlist_view import (
     STATUS_MISSING,
@@ -116,16 +120,19 @@ class CacheAnalyzer:
         prices: PriceRepository,
         agent_command: str,
         *,
+        chips: ChipRepository | None = None,
         runner: Runner | None = None,
     ) -> None:
         self._prices = prices
+        self._chips = chips
         self._agent_command = agent_command
         self._runner = runner
 
     def analyze(self, symbol: str) -> str:
         """Analyse ``symbol`` with the default question and return the AI output."""
         prices = self._prices.query_prices(symbol, _MIN_DATE, _MAX_DATE)
-        markdown = to_markdown(symbol, prices)
+        chips = self._chips.query_chips(symbol, _MIN_DATE, _MAX_DATE) if self._chips else None
+        markdown = to_markdown(symbol, prices, chips)
         instruction = build_prompt(symbol)
         payload = f"{instruction}\n\n{markdown}"
         if self._runner is not None:
@@ -147,11 +154,16 @@ def build_app(
     was resolved; otherwise the ``a`` key is a no-op rather than an error.
     """
     prices = PriceRepository(conn)
+    chips = ChipRepository(conn)
     watchlist = WatchlistRepository(conn)
     repo = StorageWatchlistSource(watchlist, prices, today=today)
-    orchestrator = FetchOrchestrator([YfinanceSource(), TwseSource()], prices)
+    orchestrator = FetchOrchestrator(
+        [YfinanceSource(), TwseSource()], prices, chip_repository=chips
+    )
     symbols = [entry.symbol for entry in watchlist.list()]
-    analyzer = CacheAnalyzer(prices, agent_command) if agent_command else None
+    analyzer = (
+        CacheAnalyzer(prices, agent_command, chips=chips) if agent_command else None
+    )
     return TsicApp(
         repo=repo,
         orchestrator=orchestrator,

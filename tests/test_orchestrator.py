@@ -26,6 +26,8 @@ class FakeSource(BaseSource):
         error: Exception | None = None,
         block: threading.Event | None = None,
         available: bool = True,
+        chips: list[ChipFlow] | None = None,
+        chip_error: Exception | None = None,
     ) -> None:
         self._name = name
         self._priority = priority
@@ -33,7 +35,10 @@ class FakeSource(BaseSource):
         self._error = error
         self._block = block
         self._available = available
+        self._chips = chips
+        self._chip_error = chip_error
         self.calls: list[tuple[str, str, str]] = []
+        self.chip_calls: list[tuple[str, str, str]] = []
 
     name = property(lambda self: self._name)  # type: ignore[assignment]
     priority = property(lambda self: self._priority)  # type: ignore[assignment]
@@ -59,7 +64,12 @@ class FakeSource(BaseSource):
         ]
 
     def fetch_chips(self, symbol: str, start: str, end: str) -> list[ChipFlow]:
-        raise NotImplementedError
+        self.chip_calls.append((symbol, start, end))
+        if self._chip_error is not None:
+            raise self._chip_error
+        if self._chips is None:
+            raise NotImplementedError
+        return [c for c in self._chips if start <= c.date <= end]
 
     def fetch_fundamentals(
         self, symbol: str, start: str, end: str
@@ -310,3 +320,75 @@ def test_empty_symbols_returns_empty_summary() -> None:
     summary = orch.fetch_prices([], "2026-06-01", "2026-06-30")
     assert isinstance(summary, FetchSummary)
     assert summary.results == []
+
+
+# --- 籌碼面 (chip) fetch integration (best-effort companion) -----------------
+
+
+class FakeChipRepo:
+    """In-memory ChipRepository stand-in: first-write-wins on (symbol, date)."""
+
+    def __init__(self) -> None:
+        self._rows: dict[tuple[str, str], ChipFlow] = {}
+
+    def upsert_chips(self, chips: list[ChipFlow]) -> int:
+        written = 0
+        for chip in chips:
+            key = (chip.symbol, chip.date)
+            if key not in self._rows:
+                self._rows[key] = chip
+                written += 1
+        return written
+
+    def latest_chip_date(self, symbol: str) -> str | None:
+        dates = [d for (s, d) in self._rows if s == symbol]
+        return max(dates) if dates else None
+
+    def rows_for(self, symbol: str) -> list[ChipFlow]:
+        return [c for (s, _), c in self._rows.items() if s == symbol]
+
+
+def _chip(symbol: str = "2330", date: str = "2026-06-25") -> ChipFlow:
+    return ChipFlow(
+        symbol=symbol, date=date, foreign_net=1, trust_net=2, dealer_net=3, source="s"
+    )
+
+
+def test_chips_fetched_and_stored_when_repo_injected() -> None:
+    source = FakeSource(
+        "s", 1, prices=[_price("2026-06-25")], chips=[_chip(date="2026-06-25")]
+    )
+    chip_repo = FakeChipRepo()
+    orch = FetchOrchestrator([source], FakeRepo(), chip_repository=chip_repo)
+
+    summary = orch.fetch_prices(["2330"], "2026-06-01", "2026-06-30")
+
+    assert summary.success_count == 1
+    assert source.chip_calls  # chips were requested
+    assert len(chip_repo.rows_for("2330")) == 1
+
+
+def test_no_chip_repo_means_chips_never_fetched() -> None:
+    source = FakeSource("s", 1, prices=[_price("2026-06-25")], chips=[_chip()])
+    orch = FetchOrchestrator([source], FakeRepo())
+
+    orch.fetch_prices(["2330"], "2026-06-01", "2026-06-30")
+
+    assert source.chip_calls == []  # the chip path stays inert without a repo
+
+
+def test_chip_error_does_not_fail_the_symbol() -> None:
+    source = FakeSource(
+        "s",
+        1,
+        prices=[_price("2026-06-25")],
+        chip_error=RuntimeError("T86 down"),
+    )
+    chip_repo = FakeChipRepo()
+    orch = FetchOrchestrator([source], FakeRepo(), chip_repository=chip_repo)
+
+    summary = orch.fetch_prices(["2330"], "2026-06-01", "2026-06-30")
+
+    # Price still succeeds; the chip failure is swallowed (best-effort).
+    assert summary.success_count == 1
+    assert chip_repo.rows_for("2330") == []

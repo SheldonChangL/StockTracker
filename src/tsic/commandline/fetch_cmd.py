@@ -31,7 +31,7 @@ from tsic.fetching import FetchOrchestrator
 from tsic.sources import TwseSource, YfinanceSource
 from tsic.sources.base import BaseSource
 from tsic.storage import database, migrations, summary
-from tsic.storage.repository import PriceRepository
+from tsic.storage.repository import ChipRepository, PriceRepository
 
 #: Default symbols fetched concurrently when ``--concurrency`` is not given.
 _DEFAULT_CONCURRENCY = 3
@@ -146,6 +146,7 @@ def fetch(
             _default_sources(),
             PriceRepository(conn),
             concurrency=_clamp_concurrency(concurrency),
+            chip_repository=ChipRepository(conn),
         )
         result = orchestrator.fetch_prices(resolved, start_date, end_date)
     finally:

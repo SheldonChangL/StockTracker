@@ -20,7 +20,11 @@ from tsic.fetching.orchestrator import FetchOrchestrator
 from tsic.models import ChipFlow, DailyPrice, Fundamental
 from tsic.sources.base import BaseSource
 from tsic.storage import database, migrations
-from tsic.storage.repository import PriceRepository, WatchlistRepository
+from tsic.storage.repository import (
+    ChipRepository,
+    PriceRepository,
+    WatchlistRepository,
+)
 from tsic.tui.app import TsicApp
 from tsic.tui.launcher import CacheAnalyzer, build_app
 from tsic.tui.watchlist_view import STATUS_FRESH, WatchlistRow
@@ -265,6 +269,57 @@ def test_press_a_pipes_default_question_to_agent() -> None:
             conn.close()
 
     asyncio.run(scenario())
+
+
+def test_analyzer_feeds_chip_data_into_the_prompt() -> None:
+    """When chips are cached, the analysis payload gains the 籌碼面 columns."""
+
+    captured: dict[str, object] = {}
+
+    def fake_runner(argv: list[str], payload: str) -> str:
+        captured["payload"] = payload
+        return "AI 回應"
+
+    conn = database.connect(":memory:", check_same_thread=False)
+    migrations.migrate(conn)
+    prices = PriceRepository(conn)
+    prices.upsert_prices(
+        [
+            DailyPrice(
+                symbol="2330",
+                date="2026-06-13",
+                open=1000.0,
+                high=1010.0,
+                low=990.0,
+                close=1005.0,
+                volume=12345,
+                source="fake",
+            )
+        ]
+    )
+    chips = ChipRepository(conn)
+    chips.upsert_chips(
+        [
+            ChipFlow(
+                symbol="2330",
+                date="2026-06-13",
+                foreign_net=5000,
+                trust_net=200,
+                dealer_net=-100,
+                source="twse",
+            )
+        ]
+    )
+    try:
+        analyzer = CacheAnalyzer(prices, "cat", chips=chips, runner=fake_runner)
+        analyzer.analyze("2330")
+        payload = captured["payload"]
+        assert isinstance(payload, str)
+        # Chip columns and the actual net-flow value reached the AI.
+        assert "外資" in payload
+        assert "5000" in payload
+    finally:
+        conn.close()
 
 
 def test_press_a_is_noop_without_analyzer() -> None:
