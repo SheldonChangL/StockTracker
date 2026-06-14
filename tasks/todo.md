@@ -1,27 +1,35 @@
-# Story 8.2 — 個股詳細頁（30 日 OHLCV + 籌碼/基本面摘要，FR-28）
+# Story 8.4 — 使用者啟動 `tsic tui` 並用鍵盤操作（FR-26/FR-29）
 
 ## Plan
-- [x] 新增 `src/tsic/tui/detail_view.py`（prereq，沿用 Story 8.1 純展示 + Textual App 風格）
-  - 純展示函式：`ohlcv_rows`（取最近 30 交易日、最新在上）、`chip_summary`（無資料回傳「無資料」）、`fundamental_summary`（缺漏欄位以「—」呈現）
-  - `StockDetail` 資料物件（注入式）、`DetailApp` 渲染：`id="detail-ohlcv"` 表格 + 籌碼/基本面摘要面板
-- [x] 新增 `tests/test_detail_view.py`：AC-1~AC-4（含 Pilot 查詢 `#detail-ohlcv` 斷言列數 ≤ 30）
-- [x] 驗證：`uv run pytest`、`uv run ruff check`
+- [ ] `src/tsic/tui/app.py`：加入 `f`/`a`/`q` 鍵綁定與動作
+  - `Analyzer` Protocol（注入式分析接縫）
+  - `action_fetch_selected`（f）：對游標選取的股票跑單股背景更新 worker
+  - `action_analyze_selected`（a）：對選取股票以預設問題跑 AI 分析 worker（注入 analyzer）
+  - `q` → 內建 `action_quit`
+  - 重構共用 `_fetch(symbols)` worker body，保留 `action_update`（u）行為
+- [ ] `src/tsic/tui/launcher.py`（prod wiring）
+  - `StorageWatchlistSource`（WatchlistRepository + PriceRepository → WatchlistRow）
+  - `CacheAnalyzer`（cache → to_markdown + 預設 build_prompt → pipe.run）
+  - `build_app(conn, ...)` 與 `launch(db_path)`
+- [ ] `src/tsic/commandline/app.py`：`tui` 由 stub 改為真實啟動；移除已無用的 `_stub`
+- [ ] 測試
+  - `tests/test_tui_keys.py`：AC-1（f→worker）、AC-2（a→analyzer 被呼叫、預設問題）、AC-3（q→結束）、AC-4（build_app headless run_test 不拋例外）
+  - `tests/test_cli.py`：更新 tui 不再是 stub
+- [ ] 驗證：`uv run pytest`、`uv run ruff check`
 
 ## Review
-- 248 測試通過（237 原有 + 11 新增）、ruff 乾淨。
-- AC-1：`DetailApp` 掛載 `DataTable(id="detail-ohlcv")`，欄位為 `OHLCV_COLUMNS`（日期+OHLCV）。
-- AC-2：`chip_summary` 取最新一筆籌碼記錄組摘要；無資料回傳「無資料」而非報錯，面板正常渲染。
-- AC-3：`fundamental_summary` 依固定欄位輸出，None/缺欄以「—」呈現；部分資料顯示可用值。
-- AC-4：以 `run_test()` 的 Pilot 查 `#detail-ohlcv`，給 45 筆仍 `row_count == 30`（≤ 30）。
+- 260 測試通過（原 248 + test_tui_keys.py 新增 7 + test_cli 調整），ruff 乾淨。
+- AC-1：`f` → `action_fetch_selected` 取游標列代號，跑與 `u` 共用的 threaded fetch worker，但只更新選取股票（gated 測試斷言 worker 在途且僅 fetch `2330`）。
+- AC-2：`a` → `action_analyze_selected` 在 worker 上跑注入的 `Analyzer`；提供 fake analyzer 斷言被呼叫，並以真實 `CacheAnalyzer`+fake runner 驗證走預設 `build_prompt` 問題的真實分析路徑。
+- AC-3：`q` 綁定 Textual 內建 `action_quit`，press 後 `is_running` 為 False。
+- AC-4：`build_app` 以 migrated 連線組裝（StorageWatchlistSource + orchestrator + analyzer），headless `run_test()` 不拋例外，watchlist 正確渲染。
 
 ### 設計決策
-- 與 Story 8.1 一致：展示規則為純函式（可單元測試），`DetailApp` 只渲染注入的 `StockDetail`，
-  不含儲存邏輯、不自訂色彩/CSS（沿用 Textual 預設主題）。
-- OHLCV 以最新日在上（descending）便於檢視近況；輸入沿用 `query_prices` 升冪、取尾 30 筆反轉。
-- 籌碼面摘要採「最新一筆」淨流向；基本面欄位用 `(label, attr)` 對照表，None 一律映為「—」。
+- 沿用 8.1/8.3 的「注入式接縫」風格：app 不含儲存/分析邏輯，僅依賴 `WatchlistSource`、`UpdateRunner`、新增的 `Analyzer` Protocol。
+- 重構共用 `_fetch(symbols)`，`u`（全部）與 `f`（選取）共用同一 threaded worker 與進度回報；`u` 行為與既有 8.3 測試不變。
+- production wiring 集中在 `tui/launcher.py`，`CacheAnalyzer` 直接重用 Story 5.x 的 to_markdown/build_prompt/pipe.run，`tui` CLI 改為真實啟動並移除已無用的 `_stub`。
 
 ### 限制 / Tester 重點
-- 本故事為 prereq：尚未串接 `TsicApp` 的選股導航與真實 repository 取數（留待後續 wiring 故事）。
-  儲存層目前無 chip/fundamental 的讀取 repository 方法；資料以 `StockDetail` 注入。
-- `Fundamental.pb` / `dividend_yield` 預設為 0.0（非 None），故不會被視為缺漏；
-  缺漏判定僅針對 None（period/eps/pe_ratio_qtr_end/revenue/gross_margin 等 Optional 欄位）。
+- `launch()` 與分析/抓取 worker 共用單一 `check_same_thread=False` 連線；寫入經 orchestrator 鎖序列化，但 `CacheAnalyzer`/watchlist 讀取與 orchestrator 寫入併發在極端情況下仍有 SQLite 競爭風險（V1 單人本機可接受）。
+- `StorageWatchlistSource` 以整段歷史查詢計算 row_count/最新收盤，名稱欄無資料來源固定為「—」。
+- AC-4 真實 `uv run python -m tsic tui` 需 TTY；CI 以 `run_test()` headless 驗證（符合 story 指定）。
