@@ -26,13 +26,24 @@ On an HTTP 429 the request is retried up to three times with a *doubling*
 gives up and raises :class:`~tsic.sources.yfinance_source.SourceFetchError`
 (AC-3). The shared bucket is acquired before every attempt, so even the retries
 respect the ``1 req/s`` ceiling.
+
+The same source also serves institutional net-flows (籌碼面, Story 3.4) from the
+official ``T86`` (三大法人買賣超) report. Unlike ``STOCK_DAY``, ``T86`` is a
+*cross-sectional daily* report: one request returns every symbol's flows for a
+single trading day, so a date range is fetched as one request **per calendar
+day** (``date=YYYYMMDD``), each filtered down to the requested symbol. Days with
+no report (weekends, holidays, or a symbol absent from that day's data) are
+skipped silently — never written, never raised (AC-2). Chip fetches share the
+exact same per-source bucket and retry path as prices, so the ``1 req/s`` /
+``concurrency=1`` budget is honoured across both (AC-3).
 """
 
 from __future__ import annotations
 
+import datetime
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import httpx
@@ -45,6 +56,25 @@ logger = logging.getLogger(__name__)
 
 #: Official monthly daily-quote endpoint (JSON variant).
 _BASE_URL = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+
+#: Official daily institutional net-flow (三大法人買賣超) endpoint (JSON variant).
+_T86_URL = "https://www.twse.com.tw/fund/T86"
+
+#: ``T86`` column labels mapped to the :class:`ChipFlow` fields they fill. Each
+#: field lists the accepted header(s); when more than one is present in a row
+#: their values are *summed* (TWSE splits 外資/自營商 into sub-columns in the
+#: modern format but kept a single aggregate column in the legacy one).
+_FOREIGN_FIELDS = (
+    "外資買賣超股數",  # legacy aggregate column
+    "外陸資買賣超股數(不含外資自營商)",  # modern: foreign ex-dealer ...
+    "外資自營商買賣超股數",  # ... plus foreign-dealer leg
+)
+_TRUST_FIELDS = ("投信買賣超股數",)
+_DEALER_FIELDS = (
+    "自營商買賣超股數",  # legacy/modern aggregate column
+    "自營商買賣超股數(自行買賣)",  # modern: proprietary ...
+    "自營商買賣超股數(避險)",  # ... plus hedging leg
+)
 
 #: Maximum number of retries after the initial attempt when rate-limited (AC-3).
 _MAX_RETRIES = 3
@@ -107,12 +137,17 @@ class TwseSource(BaseSource):
         return prices
 
     def _fetch_month(self, symbol: str, year: int, month: int) -> Any:
-        """Fetch one month's payload, retrying 429s with a doubling backoff (AC-3).
+        """Fetch one month's ``STOCK_DAY`` payload (retries 429s, AC-3)."""
+        url = f"{_BASE_URL}?response=json&date={year}{month:02d}01&stockNo={symbol}"
+        return self._fetch_json(url, f"{symbol} {year}{month:02d}")
+
+    def _fetch_json(self, url: str, context: str) -> Any:
+        """GET ``url`` and return decoded JSON, retrying 429s with backoff (AC-3).
 
         The shared rate-limit bucket is acquired before *every* attempt so the
-        ``1 req/s`` ceiling holds across retries too (AC-4).
+        ``1 req/s`` ceiling holds across retries too (AC-3). ``context`` is a
+        human-readable label (e.g. ``"2330 202606"``) used only for log lines.
         """
-        url = f"{_BASE_URL}?response=json&date={year}{month:02d}01&stockNo={symbol}"
         backoff = _INITIAL_BACKOFF
         for attempt in range(_MAX_RETRIES + 1):
             self.bucket.acquire()
@@ -123,11 +158,8 @@ class TwseSource(BaseSource):
 
             if attempt < _MAX_RETRIES:
                 logger.warning(
-                    "TWSE fetch for %s %d%02d rate-limited (attempt %d/%d); "
-                    "backing off %.0fs",
-                    symbol,
-                    year,
-                    month,
+                    "TWSE fetch for %s rate-limited (attempt %d/%d); backing off %.0fs",
+                    context,
                     attempt + 1,
                     _MAX_RETRIES + 1,
                     backoff,
@@ -136,13 +168,42 @@ class TwseSource(BaseSource):
                 backoff *= 2  # AC-3: double the backoff before each retry.
 
         raise SourceFetchError(
-            f"TWSE fetch for {symbol} {year}{month:02d} stayed rate-limited (429) "
+            f"TWSE fetch for {context} stayed rate-limited (429) "
             f"after {_MAX_RETRIES + 1} attempts"
         )
 
     def fetch_chips(self, symbol: str, start: str, end: str) -> list[ChipFlow]:
-        """Not provided by this story; institutional flows come from other sources."""
-        raise NotImplementedError("twse institutional flows are out of scope")
+        """Fetch institutional net-flows for ``symbol`` in ``[start, end]`` (T86).
+
+        ``T86`` is a per-day cross-sectional report, so this issues one request
+        per calendar day in range (AC-3 shared bucket throttles them to 1 req/s)
+        and keeps only the row matching ``symbol``. Days with no report — a
+        non-``OK`` payload (weekend/holiday) or a day whose data omits ``symbol``
+        — are skipped silently rather than written or raised (AC-2).
+
+        Args:
+            symbol: Taiwan stock symbol, e.g. ``"2330"``.
+            start: Inclusive ISO ``YYYY-MM-DD`` start date.
+            end: Inclusive ISO ``YYYY-MM-DD`` end date.
+
+        Returns:
+            One :class:`~tsic.models.ChipFlow` per trading day with data, each
+            with ``source="twse"`` and signed net values (AC-1).
+
+        Raises:
+            SourceFetchError: If any day stays rate-limited (429) after the full
+                retry budget (AC-3).
+        """
+        flows: list[ChipFlow] = []
+        for date in _days_in_range(start, end):
+            url = (
+                f"{_T86_URL}?response=json&date={date.replace('-', '')}&selectType=ALL"
+            )
+            payload = self._fetch_json(url, f"{symbol} {date}")
+            flow = _parse_chips(payload, symbol, date)
+            if flow is not None:
+                flows.append(flow)
+        return flows
 
     def fetch_fundamentals(
         self, symbol: str, start: str, end: str
@@ -167,6 +228,71 @@ def _months_in_range(start: str, end: str) -> list[tuple[int, int]]:
             month = 1
             year += 1
     return months
+
+
+def _days_in_range(start: str, end: str) -> Iterator[str]:
+    """Yield every ISO ``YYYY-MM-DD`` date in ``[start, end]`` inclusive.
+
+    Drives the one-request-per-day ``T86`` fan-out (AC-2/AC-3). Non-trading days
+    are not filtered here — the parser skips them via the no-data payload.
+    """
+    current = datetime.date.fromisoformat(start)
+    last = datetime.date.fromisoformat(end)
+    one_day = datetime.timedelta(days=1)
+    while current <= last:
+        yield current.isoformat()
+        current += one_day
+
+
+def _parse_chips(payload: Any, symbol: str, date: str) -> ChipFlow | None:
+    """Convert one day's ``T86`` payload into a :class:`ChipFlow` for ``symbol``.
+
+    ``T86`` rows are keyed by 證券代號 and the net-flow columns are
+    thousands-separated signed share counts. Field positions vary between the
+    legacy and modern report layouts, so columns are resolved by *header name*
+    via :data:`_FOREIGN_FIELDS` / :data:`_TRUST_FIELDS` / :data:`_DEALER_FIELDS`
+    (summing the sub-columns the modern layout splits into).
+
+    Returns ``None`` — never raises — when the day has no report (``stat`` not
+    ``"OK"``), when ``symbol`` is absent from that day's data, or when the
+    matched row's numeric cells are unparseable (AC-2).
+    """
+    if not payload or payload.get("stat") != "OK":
+        return None
+
+    fields = payload.get("fields") or []
+    column = {name: i for i, name in enumerate(fields)}
+    for row in payload.get("data") or []:
+        if not row or row[0].strip() != symbol:
+            continue
+        try:
+            return ChipFlow(
+                symbol=symbol,
+                date=date,
+                foreign_net=_sum_fields(row, column, _FOREIGN_FIELDS),
+                trust_net=_sum_fields(row, column, _TRUST_FIELDS),
+                dealer_net=_sum_fields(row, column, _DEALER_FIELDS),
+                source="twse",
+            )
+        except (KeyError, ValueError, IndexError):
+            # A matched-but-malformed row is treated as no data for the day.
+            return None
+    return None
+
+
+def _sum_fields(
+    row: list[str], column: dict[str, int], field_names: tuple[str, ...]
+) -> int:
+    """Sum the present ``field_names`` columns of ``row`` into a signed int.
+
+    Aliases that aren't in this payload's header are skipped, so the legacy
+    aggregate column and the modern split sub-columns both resolve correctly.
+    Raises :class:`ValueError` if *no* alias is present (an unexpected layout).
+    """
+    matched = [name for name in field_names if name in column]
+    if not matched:
+        raise ValueError(f"no T86 column among {field_names}")
+    return sum(_to_int(row[column[name]]) for name in matched)
 
 
 def _parse_prices(payload: Any, symbol: str, start: str, end: str) -> list[DailyPrice]:
